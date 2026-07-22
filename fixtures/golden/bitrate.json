@@ -1,0 +1,6 @@
+[
+  {"source": 1000000, "ratio": 0.76, "min_kbps": 250, "max_kbps": 0, "target": 760000},
+  {"source": 1000000, "ratio": 0.64, "min_kbps": 250, "max_kbps": 0, "target": 640000},
+  {"source": 200000, "ratio": 0.76, "min_kbps": 250, "max_kbps": 0, "target": 250000},
+  {"source": 10000000, "ratio": 0.76, "min_kbps": 250, "max_kbps": 4000, "target": 4000000}
+]

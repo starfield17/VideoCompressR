@@ -1,0 +1,32 @@
+[package]
+name = "video-compressor-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[lib]
+name = "video_compressor_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "video-compressor-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tauri-build = { version = "2.5", features = [] }
+ts-rs = "10.1"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.8", features = [] }
+tauri-plugin-dialog = "2.4"
+ts-rs = "10.1"
+tokio.workspace = true
+tokio-util.workspace = true
+vc-core = { path = "../../../crates/vc-core" }
+vc-runtime = { path = "../../../crates/vc-runtime" }

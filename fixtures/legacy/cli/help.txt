@@ -1,0 +1,13 @@
+usage: -c [-h] {plan,encode,preview,preset} ...
+
+Video compressor CLI
+
+positional arguments:
+  {plan,encode,preview,preset}
+    plan                Preview the encode plan
+    encode              Execute the encode plan
+    preview             Run a manual preview sample
+    preset              Manage presets
+
+options:
+  -h, --help            show this help message and exit

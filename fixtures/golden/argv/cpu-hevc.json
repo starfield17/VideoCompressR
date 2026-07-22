@@ -1,0 +1,4 @@
+{
+  "required_pairs": [["-progress", "pipe:1"], ["-nostats", null], ["-c:v", "libx265"], ["-c:a", "copy"], ["-pix_fmt", "yuv420p"]]
+}
+}

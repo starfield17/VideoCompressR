@@ -1,0 +1,460 @@
+{
+  "reference_root": "read-only",
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "bytes": 6106,
+      "sha256": "6c7f2cd374841524de44a67918e7c1637aa32d7fb1775c2b38efbf0aca3dd940"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "bytes": 9779,
+      "sha256": "3660995589409933cc782b0804c608c82378cbbc620c218352510071d7f9dd3b"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 823,
+      "sha256": "e18a2fca32840cbd1e2b80e6d3c56bd6bd7693b0c3465097862878118497b35f"
+    },
+    {
+      "path": "FFmpeg/Download.txt",
+      "bytes": 51,
+      "sha256": "8e50e7f6dbe45e67378ee0e19b78ff64003051d262609ffacce517c4b107df84"
+    },
+    {
+      "path": "README.md",
+      "bytes": 7562,
+      "sha256": "63c6576ae9fe595bc83965c540c5d35496a74b6d47f7d345ca20976e6b58f7df"
+    },
+    {
+      "path": "cli/__init__.py",
+      "bytes": 47,
+      "sha256": "75624b8f31bc1cde7501f4389a505f1c0b7fea94f7998e2e91345fb4518c943d"
+    },
+    {
+      "path": "cli/__pycache__/__init__.cpython-314.pyc",
+      "bytes": 239,
+      "sha256": "d074abdf6a4b892641e183fec1fe27ac035c0d7f675f89f391eaac522e4cae4e"
+    },
+    {
+      "path": "cli/__pycache__/cli_entry.cpython-314.pyc",
+      "bytes": 27535,
+      "sha256": "1296109c63f2217497a245cfa4bf95d9c1a21cc3216c68ac3d94ce39ab91ffd4"
+    },
+    {
+      "path": "cli/__pycache__/cli_interactive.cpython-314.pyc",
+      "bytes": 8612,
+      "sha256": "eea0202c592d07c40e0112d8b1ef6d817e18f0e332b0b2194405c8efe8805d52"
+    },
+    {
+      "path": "cli/cli_entry.py",
+      "bytes": 17495,
+      "sha256": "9af3b549d23fbc51d7bad1b5040fcd95aa08d0f1019191b96c06f362104093a4"
+    },
+    {
+      "path": "cli/cli_interactive.py",
+      "bytes": 3878,
+      "sha256": "dfd94c9ca07458a94a804c36b7c578bb246240b487e2027f9aa28ec9bb315e16"
+    },
+    {
+      "path": "config/i18n/en.json",
+      "bytes": 13575,
+      "sha256": "b8c0a6d9e59d8394f20a41b2647ae716521cc25270240c05f8236ff94d12d778"
+    },
+    {
+      "path": "config/i18n/zh_cn.json",
+      "bytes": 13638,
+      "sha256": "49037fce3a6ed02505bd868281e43c84b01e1c9582db093a5df3c1523a87c02b"
+    },
+    {
+      "path": "config/presets/default_av1.json",
+      "bytes": 355,
+      "sha256": "2d51d8d4f0c71ab32bc7592771f209f881d31d10af9389d2cb96bae5f9b85c65"
+    },
+    {
+      "path": "config/presets/default_hevc.json",
+      "bytes": 356,
+      "sha256": "72ecc239a99409752991b3ad974ea81b4baef066e7c9572f9117f5efb42ebe41"
+    },
+    {
+      "path": "core/__init__.py",
+      "bytes": 61,
+      "sha256": "cf02e904803fdf00dfbb23a8cc9eae24b0821f53b564cc356e087b83654b2811"
+    },
+    {
+      "path": "core/__pycache__/__init__.cpython-314.pyc",
+      "bytes": 254,
+      "sha256": "ce1771a91fdd48ab4f5d2ce00397a4e23666b2322d5ed3c0160b65f1553cb0a2"
+    },
+    {
+      "path": "core/__pycache__/app_paths.cpython-314.pyc",
+      "bytes": 6454,
+      "sha256": "5ca909cc892a10b3797aa1e6a053a8abfc2217f568baaf36de631f3d9a810670"
+    },
+    {
+      "path": "core/__pycache__/bitrate_policy.cpython-314.pyc",
+      "bytes": 2309,
+      "sha256": "f7cf19e7b9559ab1251d915593f3dd2c214a0c9cc3e324947dffbe47d9847055"
+    },
+    {
+      "path": "core/__pycache__/build_ffmpeg_cmd.cpython-314.pyc",
+      "bytes": 8423,
+      "sha256": "8d6ca14cdb7680eec458c5571d033de8b0f26c3b640fc7655c63665ca0c114b0"
+    },
+    {
+      "path": "core/__pycache__/discover_ffmpeg.cpython-314.pyc",
+      "bytes": 8045,
+      "sha256": "e6d3e573a6b53190114a1276fb75f777b08be48c14e53db7d6e62ae7862b355d"
+    },
+    {
+      "path": "core/__pycache__/encoder_capability_cache.cpython-314.pyc",
+      "bytes": 11935,
+      "sha256": "c21deaec5aed504d3f6c773178ae1bddf1b61a9c54d3076ee3de956eb10287aa"
+    },
+    {
+      "path": "core/__pycache__/encoder_caps.cpython-314.pyc",
+      "bytes": 15209,
+      "sha256": "d8aab8b0e1ae7f1902692242331167da51ea987bf44f20d9edcf0de3224372cc"
+    },
+    {
+      "path": "core/__pycache__/exec_encode.cpython-314.pyc",
+      "bytes": 25331,
+      "sha256": "f91464d32c9326552c477e525545bde7181ceafa16dc7a007a6f76cfd3a4bc56"
+    },
+    {
+      "path": "core/__pycache__/external_subtitles.cpython-314.pyc",
+      "bytes": 4208,
+      "sha256": "86dbeb214a485dda5e7f89e6cfe10b550a07fc9f45bfb113de714f9c4a2191e5"
+    },
+    {
+      "path": "core/__pycache__/i18n.cpython-314.pyc",
+      "bytes": 2872,
+      "sha256": "0ecedeb68a14e480d5169b4355f2554a9968b5e7ad650cdabf208575caa15ee1"
+    },
+    {
+      "path": "core/__pycache__/models.cpython-314.pyc",
+      "bytes": 8327,
+      "sha256": "a7fa95e64c2a9a658d378f2320695e0e7e72fdbe5f0a6b5ad8502766b3c5c2df"
+    },
+    {
+      "path": "core/__pycache__/parallel_queue_exec.cpython-314.pyc",
+      "bytes": 11055,
+      "sha256": "3bbc7ca59636484ec1fcd14ea08edb5f59bc6b6822601dd23f20f25810226fa6"
+    },
+    {
+      "path": "core/__pycache__/path_utils.cpython-314.pyc",
+      "bytes": 5429,
+      "sha256": "f3c3cb43eab68905cfedae6a0cd16a2d9e069837bfa19f6ce2857c73a67695c4"
+    },
+    {
+      "path": "core/__pycache__/plan_encode.cpython-314.pyc",
+      "bytes": 15104,
+      "sha256": "cc98a512223441d7ef7106e866ccff73abd4f6aaa95d55fab1edf9527584eb43"
+    },
+    {
+      "path": "core/__pycache__/preset_store.cpython-314.pyc",
+      "bytes": 12826,
+      "sha256": "ec951e447c93642d60665e70f0ea641cc94f28396998295ed8d80bd4c202a268"
+    },
+    {
+      "path": "core/__pycache__/preview_estimate.cpython-314.pyc",
+      "bytes": 1585,
+      "sha256": "a2fb64de59e7804e948423a7459902c466d67eb33e2ccaab43a7084f18f54ffd"
+    },
+    {
+      "path": "core/__pycache__/preview_sample.cpython-314.pyc",
+      "bytes": 3060,
+      "sha256": "72d819ae5cde4c2559899f229a7670f76bb569dfc72724551d63ca2aa38f54df"
+    },
+    {
+      "path": "core/__pycache__/probe_media.cpython-314.pyc",
+      "bytes": 6936,
+      "sha256": "f5478142d260b9a3c96e51f53df8a489aee1d508c6aca0b5d8cbd0dadc300b69"
+    },
+    {
+      "path": "core/__pycache__/safety_checks.cpython-314.pyc",
+      "bytes": 2972,
+      "sha256": "c2f270cab026710fe1122f16e07fce0ce69dea925ba538153e51881551aa0ad1"
+    },
+    {
+      "path": "core/__pycache__/scan_videos.cpython-314.pyc",
+      "bytes": 2354,
+      "sha256": "51ca4a9ce9cc3348008a4031e39c55f592df919ca59cf752a12bba562ac38555"
+    },
+    {
+      "path": "core/__pycache__/subprocess_utils.cpython-314.pyc",
+      "bytes": 1544,
+      "sha256": "dbce429ab8e0f632343a71d61ef470d3bc30f8afd9046fd1ecc43560ece909c6"
+    },
+    {
+      "path": "core/app_paths.py",
+      "bytes": 3112,
+      "sha256": "e6a854cb8c37e83933f526f5521270c97afe8b12a11bf3b05a221b6efc825d53"
+    },
+    {
+      "path": "core/bitrate_policy.py",
+      "bytes": 1244,
+      "sha256": "9e551acdcbb2df0b5b8f61069e35333bd8d6b31a014690cd31f7c50dbe58cdcc"
+    },
+    {
+      "path": "core/build_ffmpeg_cmd.py",
+      "bytes": 5599,
+      "sha256": "9da1a7da203ab02e7279e2595c1e1d69ae6b7b512969acc7a0dc8869ab28d5dc"
+    },
+    {
+      "path": "core/discover_ffmpeg.py",
+      "bytes": 5037,
+      "sha256": "ef1a1026d6276354710cb1fd894746a8d1ed30437e9006be9568ef26a12aec6d"
+    },
+    {
+      "path": "core/encoder_capability_cache.py",
+      "bytes": 8187,
+      "sha256": "caf2cf17a8983edb4f2156e1a54e8985310d6488302a35e0841a98d2789ada71"
+    },
+    {
+      "path": "core/encoder_caps.py",
+      "bytes": 9942,
+      "sha256": "ecc65933133d4769a94b56ef3964bd8aaba6bd28c1f3ebe5e7becfb87b9d413d"
+    },
+    {
+      "path": "core/exec_encode.py",
+      "bytes": 20938,
+      "sha256": "7308c9c0c598c0acfd2689f824ba09ecb3a81a51db72afb93b556918231609fd"
+    },
+    {
+      "path": "core/external_subtitles.py",
+      "bytes": 2531,
+      "sha256": "4542f42d861c5f510711826eb0967c99082b0ef3773b068a0a803b899a028678"
+    },
+    {
+      "path": "core/i18n.py",
+      "bytes": 1335,
+      "sha256": "5db240abac91237f23851467dbb56f97d2e7abb2e609cb9147961e3ff8a77a7e"
+    },
+    {
+      "path": "core/models.py",
+      "bytes": 4412,
+      "sha256": "47443ab02d13d029cdf69835dca49340066d43bc819171d893e05851b386d520"
+    },
+    {
+      "path": "core/parallel_queue_exec.py",
+      "bytes": 7633,
+      "sha256": "3b3e8fb5fec0389fc342f18f47476e89ad1e71c64e5a1f3b92bdce80d55e1752"
+    },
+    {
+      "path": "core/path_utils.py",
+      "bytes": 2920,
+      "sha256": "5199da6e80d2c63bb316d790cc3bff7c53161b11f4925a5b7bfb47e312949c9f"
+    },
+    {
+      "path": "core/plan_encode.py",
+      "bytes": 12024,
+      "sha256": "6dd248f900296c13958fbe6dfee089ec09d5840c15c6422338f661644778210e"
+    },
+    {
+      "path": "core/preset_store.py",
+      "bytes": 7464,
+      "sha256": "fcb80e84bc15b914b4e311e14caef9ce58e94358fe30b2295670551efac4c2a0"
+    },
+    {
+      "path": "core/preview_estimate.py",
+      "bytes": 954,
+      "sha256": "3342d2d20ad3414c43667acd52ea7b7e4cd4ec60471c8519d51792e12a013fc7"
+    },
+    {
+      "path": "core/preview_sample.py",
+      "bytes": 2243,
+      "sha256": "64359cc86d37aeb7e4efe99d45ef59a35b516fb1b01e580925e2330990e23da1"
+    },
+    {
+      "path": "core/probe_media.py",
+      "bytes": 4332,
+      "sha256": "741c9016e7cbffe6304680e4e7a69d6263c73165d88eb087895bd43a3210bb5d"
+    },
+    {
+      "path": "core/safety_checks.py",
+      "bytes": 1632,
+      "sha256": "cb53defbd1ccc06f817826f3ef06d5d706e5929e86d7ba07f5e4e96090b12035"
+    },
+    {
+      "path": "core/scan_videos.py",
+      "bytes": 1265,
+      "sha256": "c1962042c5bd73d68580fb4e4c9254894a463fcd392b63601ba1f4553253163b"
+    },
+    {
+      "path": "core/subprocess_utils.py",
+      "bytes": 667,
+      "sha256": "3d24e9b01d92ca428ecc0ba615adcbe4b0e6f8480333be55e7a725c4ace852e8"
+    },
+    {
+      "path": "gui/__init__.py",
+      "bytes": 36,
+      "sha256": "6cc6c88d3573d697c4725a93874c8e747fd27bdf229971378a5b1f87f9be2bae"
+    },
+    {
+      "path": "gui/activity_log_window.py",
+      "bytes": 5540,
+      "sha256": "0b4f8356f7b4d24d06293fae113134d917275620c4af7441d3dd4e03995946dd"
+    },
+    {
+      "path": "gui/gui_entry.py",
+      "bytes": 646,
+      "sha256": "8420af01aeca4fe00fce5337960072e826c3f9c52612ed611faab68888a5978d"
+    },
+    {
+      "path": "gui/gui_mainwindow.py",
+      "bytes": 80410,
+      "sha256": "ca29a173be009b773d39f192741414476d90a550a5d009501e6a8ab7b080311a"
+    },
+    {
+      "path": "gui/gui_workers.py",
+      "bytes": 9425,
+      "sha256": "31852793c7ce13257415c62356c135b10d30aee9d3157f20cf29dec38232d2f8"
+    },
+    {
+      "path": "gui/preset_manager_dialog.py",
+      "bytes": 4502,
+      "sha256": "535ffd95417a7a1080a7072f2f87eee01656f29fa7223ee7aa291126d0329e77"
+    },
+    {
+      "path": "gui/preview_result_dialog.py",
+      "bytes": 1125,
+      "sha256": "103d32ece0fdbc757486a525ab0f7be734b891c79db2e1b2dbf33d76e0c6ff9c"
+    },
+    {
+      "path": "gui/queue_manager.py",
+      "bytes": 10347,
+      "sha256": "b4b5e9a994fb350bbd5d43ad68ba5ffd010e9fcdca41e757875ed0c5ade54191"
+    },
+    {
+      "path": "gui/queue_state.py",
+      "bytes": 11974,
+      "sha256": "d79d51ed50dec3db9ee7ce33957e0da1cf9a7d60d8712118fce8307b646b0e7a"
+    },
+    {
+      "path": "gui/queue_table.py",
+      "bytes": 26881,
+      "sha256": "e0c0862438dbbbd92083ae888eede46138935ca73018463243cb2498bae5f8a3"
+    },
+    {
+      "path": "gui/queue_window.py",
+      "bytes": 2585,
+      "sha256": "46e3b27b484596efb04412fe2576d0aeee6e42b4e5e14d5fc2ae9377dc06c9c0"
+    },
+    {
+      "path": "gui/settings_dialog.py",
+      "bytes": 5906,
+      "sha256": "c76c9b4a0518b4c202aa0c0b2143c38ca9ddc7ded8a7d074bae070d142c607d3"
+    },
+    {
+      "path": "gui/theme.py",
+      "bytes": 4155,
+      "sha256": "d20504ca0f93e7ded880ad103b3ab7d0d0331ca0af29be2a17c25aae60c3d5f3"
+    },
+    {
+      "path": "gui/window_geometry.py",
+      "bytes": 989,
+      "sha256": "db3cca70d8b93fcb4e71c29c7eb9e545b5a3ba9ca7973cc7003c18aba3500f87"
+    },
+    {
+      "path": "launch.bat",
+      "bytes": 64,
+      "sha256": "7d291c4c1f6f30d8937db617a763ae38ce2733cc681da6db896552dbc662a963"
+    },
+    {
+      "path": "launch.sh",
+      "bytes": 347,
+      "sha256": "f39081e7e7986889b1111f9e567ef2a58e697aa5ca8995389d10bee8e34989f5"
+    },
+    {
+      "path": "main.py",
+      "bytes": 540,
+      "sha256": "9eea2393509d37de6c4d31a4fc9f3fc04c12f5adb12dde69f2e0f52f60c7cafa"
+    },
+    {
+      "path": "packaging/assets/README.md",
+      "bytes": 257,
+      "sha256": "bb186485af1c8c395f4fdea96b7ebd89575573c7bb445eef77e1e422a4445640"
+    },
+    {
+      "path": "requirements-build.txt",
+      "bytes": 50,
+      "sha256": "9cd75f3284b60b59da255f5200b0a09c934c56f5ef63ef692387a6fe8ac7070b"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 13,
+      "sha256": "6880a7f1237221dc51fbbf44d04570fcf2b6ad8eea3bf7ad9ae86024dbfd4006"
+    },
+    {
+      "path": "scripts/build_linux.sh",
+      "bytes": 600,
+      "sha256": "6ed5408cb8fe591ce02002355f40e1e90816ea9c7e09da1de8bccf0b4a33247e"
+    },
+    {
+      "path": "scripts/build_nuitka.py",
+      "bytes": 27365,
+      "sha256": "834b9b6b03db66b2573cd2ba2321d0872ba8db83ca70eb9c1b2a18da831f4bef"
+    },
+    {
+      "path": "scripts/build_windows.bat",
+      "bytes": 194,
+      "sha256": "63e9c470a9398fa80dba38f82fcdfd9c3be9116e4b0210b9c8a948685967e0eb"
+    },
+    {
+      "path": "scripts/create-dmg",
+      "bytes": 1029,
+      "sha256": "502a61e17e56ac875065401ecdb213f6b83349ed9cb82e1cf7320650b6a72d8b"
+    },
+    {
+      "path": "test/test_app_paths.py",
+      "bytes": 4421,
+      "sha256": "21e729d7efd5b6ef841761d5f855c0782394cc46b90b4a60b457c7f9c2670df3"
+    },
+    {
+      "path": "test/test_build_nuitka.py",
+      "bytes": 15812,
+      "sha256": "c06f3ce4f1d1de1c85f11dcb52a493b5a38ba7855c87874af63fe18524da6f2d"
+    },
+    {
+      "path": "test/test_discover_ffmpeg.py",
+      "bytes": 8399,
+      "sha256": "e8a99a16488e385e37e55b7774a5a891789ac5d73dab90da351fd3e12cceb054"
+    },
+    {
+      "path": "test/test_encoder_capabilities.py",
+      "bytes": 10953,
+      "sha256": "35bffbd765b85b8fdc00e5c7c42ce3915813b8e62bbcc8b88dc8a754f6bc90cb"
+    },
+    {
+      "path": "test/test_parallel_transcoding.py",
+      "bytes": 14004,
+      "sha256": "030d572efa2b9a850313bf0f74bba1629da235111e20def10a909243db77feb6"
+    },
+    {
+      "path": "test/test_quality_tuning.py",
+      "bytes": 19568,
+      "sha256": "c94d103d2dcbffec19f8b0fee5994aa39a73df883029a692b67449a998d36d18"
+    },
+    {
+      "path": "test/test_release_workflows.py",
+      "bytes": 2690,
+      "sha256": "5227f803b32eb6c576bda8acdc8ec667dcdd449e1096e4a148dad856f7d6081c"
+    },
+    {
+      "path": "test/test_smoke.py",
+      "bytes": 10280,
+      "sha256": "32c4256a7b8d81c379994f9db089765559b962f49bdb47ac6d9f6fe9ffdb97a4"
+    },
+    {
+      "path": "test/test_subprocess_utils.py",
+      "bytes": 5065,
+      "sha256": "9b6b2eea80fc9c1632c19dea129e2015e721009d9154d09d9720ba2620224c69"
+    },
+    {
+      "path": "test/test_videotoolbox.py",
+      "bytes": 16963,
+      "sha256": "569627e9690d62bde6944eef85e70bf66c56ba0bffa43a7b4f0e7ab3adc92a4d"
+    }
+  ]
+}

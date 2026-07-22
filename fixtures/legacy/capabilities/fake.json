@@ -1,0 +1,17 @@
+{
+  "schema_version": 5,
+  "ffmpeg_size_bytes": 0,
+  "ffmpeg_version": "fake-1.0",
+  "ffmpeg_version_digest": "fixture",
+  "platform_os": "fixture",
+  "platform_arch": "fixture",
+  "capability_algorithm": "5",
+  "gpu_driver_summary": null,
+  "hwaccels": [],
+  "codecs": {
+    "hevc": [
+      {"backend": "cpu", "encoder": "libx265", "supports_two_pass": true}
+    ],
+    "av1": []
+  }
+}

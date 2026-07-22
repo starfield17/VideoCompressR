@@ -1,0 +1,5 @@
+{
+  "commands": ["enqueue", "start", "start_item", "pause_after_current", "finish", "pause_complete"],
+  "expected_run_state": "paused",
+  "expected_unstarted_status": "queued"
+}

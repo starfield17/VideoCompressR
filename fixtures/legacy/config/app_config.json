@@ -1,0 +1,13 @@
+{
+  "default_preset_name": "default_hevc",
+  "keep_preview_temp": true,
+  "recent_paths": [],
+  "log_level": "info",
+  "language": "en",
+  "last_source_path": "",
+  "last_output_dir": "",
+  "workdir_path": "",
+  "ffmpeg_path": "",
+  "ffprobe_path": "",
+  "queue_table_header_state": ""
+}

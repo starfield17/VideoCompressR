@@ -1,0 +1,8 @@
+{
+  "codec": "hevc",
+  "backend": "cpu",
+  "encoder": "libx265",
+  "target_video_bitrate_bps": 3040000,
+  "default_ratio": 0.76,
+  "output_suffix": "_hevc.mp4"
+}

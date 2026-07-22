@@ -1,0 +1,15 @@
+{
+  "stage": "encode",
+  "argv_contains": [
+    "-hide_banner",
+    "-nostats",
+    "-progress",
+    "pipe:1",
+    "-c:v",
+    "libx265",
+    "-b:v",
+    "3040000",
+    "-tag:v",
+    "hvc1"
+  ]
+}

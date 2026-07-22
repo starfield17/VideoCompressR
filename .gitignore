@@ -17,6 +17,18 @@ dist/
 *.dist/
 *.onefile-build/
 *.so
+target/
+node_modules/
+.venv/
+coverage/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+*.tsbuildinfo
+test-results/
+playwright-report/
+*.profraw
+*.profdata
 
 #codex files
 .codex*

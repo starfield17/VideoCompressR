@@ -1,0 +1,15 @@
+{
+  "name": "video-compress-r",
+  "private": true,
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "dev": "pnpm --dir apps/desktop dev",
+    "build": "pnpm --dir apps/desktop build",
+    "lint": "pnpm --dir apps/desktop lint",
+    "typecheck": "pnpm --dir apps/desktop typecheck",
+    "test": "pnpm --dir apps/desktop test",
+    "test:run": "pnpm --dir apps/desktop test:run",
+    "test:browser": "pnpm --dir apps/desktop test:browser",
+    "tauri": "pnpm --dir apps/desktop tauri"
+  }
+}

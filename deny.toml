@@ -1,0 +1,50 @@
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0370", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0411", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0412", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0413", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0414", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0415", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0416", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0417", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0418", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0419", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2024-0420", reason = "Transitive Tauri GTK build dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2025-0075", reason = "Transitive Tauri URL-pattern dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2025-0080", reason = "Transitive Tauri URL-pattern dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2025-0081", reason = "Transitive Tauri URL-pattern dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2025-0098", reason = "Transitive Tauri URL-pattern dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+    { id = "RUSTSEC-2025-0100", reason = "Transitive Tauri URL-pattern dependency; no safe upgrade is available in the selected Tauri 2 stack." },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+# Workspace-inherited dependencies are intentionally declared with
+# `workspace = true`; cargo-deny reports that inheritance as a wildcard.
+wildcards = "allow"

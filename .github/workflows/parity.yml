@@ -1,0 +1,25 @@
+name: Parity gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  reference-independent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Ensure the root build does not read the reference tree
+        run: python3 scripts/check_architecture.py
+      - name: Run core, runtime, testkit, and CLI tests
+        run: cargo test --locked -p vc-core -p vc-runtime -p vc-testkit -p video-compressor
+      - name: Exercise stable CLI help and invalid-input contract
+        run: |
+          cargo run --locked --bin video-compressor -- --help
+          cargo test --locked -p video-compressor --test cli_contract
+      - name: Check tracked text and manifests
+        run: git diff --check
