@@ -489,9 +489,12 @@ mod tests {
         *supervisor.active_run.lock().await =
             Some(ActiveRun { run_id: "run-2".into(), cancel: run_two_cancel.clone() });
         drop(control);
-        cleanup.await.expect("cleanup task");
+        assert!(cleanup.await.is_ok(), "cleanup task panicked");
 
-        let active = supervisor.active_run.lock().await.clone().expect("new active run");
+        let active = match supervisor.active_run.lock().await.clone() {
+            Some(active) => active,
+            None => panic!("new active run was cleared"),
+        };
         assert_eq!(active.run_id, "run-2");
         assert!(!active.cancel.is_cancelled());
     }
