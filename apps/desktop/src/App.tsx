@@ -509,6 +509,9 @@ function AuxiliaryWindow({ kind }: { kind: AuxiliaryKind }) {
 function QueuePanel({ snapshot, t }: { snapshot: QueueSnapshotDto; t: (key: string, fallback: string) => string }) {
   const [selected, setSelected] = useState<string[]>([]);
   const [message, setMessage] = useState("");
+  const retryIds = snapshot.state.items
+    .filter((item) => selected.includes(item.itemId) && (item.status === "failed" || item.status === "cancelled"))
+    .map((item) => item.itemId);
   const updateSelection = (id: string, checked: boolean) => setSelected((current) => checked ? [...current, id] : current.filter((value) => value !== id));
   async function run(action: () => Promise<unknown>) {
     try {
@@ -525,7 +528,7 @@ function QueuePanel({ snapshot, t }: { snapshot: QueueSnapshotDto; t: (key: stri
     [ids[index], ids[next]] = [ids[next], ids[index]];
     await run(() => api.reorderQueue(ids));
   };
-  return <><p className="panel-summary">{t("gui.summary.states", "States")}: {snapshot.metrics.queuedItems} queued / {snapshot.metrics.runningItems} running / {snapshot.metrics.failedItems} failed</p><p className="queue-progress">{snapshot.metrics.queuePercent.toFixed(1)}% ({snapshot.metrics.completedItems}/{snapshot.metrics.totalItems}) · ETA {formatDuration(snapshot.metrics.etaSec)}</p><progress max="100" value={snapshot.metrics.queuePercent} />{message && <p role="alert">{message}</p>}<div className="inline-actions"><button disabled={selected.length === 0} onClick={() => run(() => api.queueRetry(selected))}>{t("gui.button.retry", "Retry")}</button><button disabled={selected.length === 0} onClick={() => run(() => api.removeQueue(selected))}>{t("gui.button.remove", "Remove")}</button><button onClick={() => move(-1)}>↑</button><button onClick={() => move(1)}>↓</button><button onClick={() => run(() => api.clearCompleted())}>{t("gui.button.clear_completed", "Clear completed")}</button></div><QueueTable items={snapshot.state.items} selected={selected} onSelect={updateSelection} t={t} /></>;
+  return <><p className="panel-summary">{t("gui.summary.states", "States")}: {snapshot.metrics.queuedItems} queued / {snapshot.metrics.runningItems} running / {snapshot.metrics.failedItems} failed</p><p className="queue-progress">{snapshot.metrics.queuePercent.toFixed(1)}% ({snapshot.metrics.completedItems}/{snapshot.metrics.totalItems}) · ETA {formatDuration(snapshot.metrics.etaSec)}</p><progress max="100" value={snapshot.metrics.queuePercent} />{message && <p role="alert">{message}</p>}<div className="inline-actions"><button disabled={retryIds.length === 0} onClick={() => run(() => api.queueRetry(retryIds))}>{t("gui.button.retry", "Retry")}</button><button disabled={selected.length === 0} onClick={() => run(() => api.removeQueue(selected))}>{t("gui.button.remove", "Remove")}</button><button onClick={() => move(-1)}>↑</button><button onClick={() => move(1)}>↓</button><button onClick={() => run(() => api.clearCompleted())}>{t("gui.button.clear_completed", "Clear completed")}</button></div><QueueTable items={snapshot.state.items} selected={selected} onSelect={updateSelection} t={t} /></>;
 }
 
 function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) {

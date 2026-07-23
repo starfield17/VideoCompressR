@@ -1,8 +1,12 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { vi } from "vitest";
 import App from "./App";
 import { api } from "./api/client";
-import type { AppSettingsDto, QueueItemDto, QueueSnapshotDto, SettingsDto } from "./api/generated";
+import type { AppSettingsDto, PlanResponseDto, QueueItemDto, QueueSnapshotDto, QueueStreamMessage, SettingsDto } from "./api/generated";
+
+const testHooks = vi.hoisted(() => ({
+  queueMessageHandler: undefined as ((message: QueueStreamMessage) => void) | undefined,
+}));
 
 const testData = vi.hoisted(() => ({
   settings: {
@@ -167,10 +171,15 @@ beforeEach(() => {
   vi.mocked(api.stopQueue).mockResolvedValue(undefined);
   vi.mocked(api.queueRetry).mockResolvedValue(undefined);
   vi.mocked(api.removeQueue).mockResolvedValue(undefined);
+  vi.mocked(api.reorderQueue).mockResolvedValue(undefined);
   vi.mocked(api.clearCompleted).mockResolvedValue(undefined);
   vi.mocked(api.saveSettings).mockResolvedValue(undefined);
   vi.mocked(api.saveAppSettings).mockResolvedValue(undefined);
   vi.mocked(api.openAuxiliary).mockResolvedValue(undefined);
+  testHooks.queueMessageHandler = undefined;
+  vi.mocked(api.subscribeQueue).mockImplementation(async (handler) => {
+    testHooks.queueMessageHandler = handler;
+  });
 });
 
 afterEach(() => {
@@ -243,8 +252,18 @@ test("successful add-to-queue persists app settings", async () => {
   });
   fireEvent.click(screen.getByRole("button", { name: /Add to Queue/ }));
   await screen.findByText(/Items: 1, ready: 1, skipped: 0/);
-  expect(api.addToQueue).toHaveBeenCalled();
-  await waitFor(() => expect(api.saveAppSettings).toHaveBeenCalled());
+  expect(api.addToQueue).toHaveBeenCalledWith(expect.objectContaining({
+    inputPath: "/videos/source.mp4",
+    outputDir: null,
+    workdir: null,
+    ffmpegPath: null,
+    ffprobePath: null,
+    settings: testData.settings,
+  }));
+  await waitFor(() => expect(api.saveAppSettings).toHaveBeenCalledWith(expect.objectContaining({
+    lastSourcePath: "/videos/source.mp4",
+    recentPaths: ["/videos/source.mp4"],
+  })));
 });
 
 test("recent path save failure keeps the successful plan and shows a warning", async () => {
@@ -326,6 +345,71 @@ test("running queue exposes pause and stop actions", async () => {
   }
 });
 
+test("busy state disables planning controls until the request completes", async () => {
+  let resolvePlan!: (value: PlanResponseDto) => void;
+  vi.mocked(api.plan).mockReturnValue(new Promise((resolve) => { resolvePlan = resolve; }));
+  render(<App />);
+  fireEvent.change(await screen.findByPlaceholderText("Select a source file or directory"), {
+    target: { value: "/videos/source.mp4" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: /Plan/ }));
+  await waitFor(() => {
+    expect(screen.getByRole("button", { name: /Plan/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Add to Queue/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^◇ Preview$/ })).toBeDisabled();
+  });
+  resolvePlan(planResponse);
+  await waitFor(() => expect(screen.getByRole("button", { name: /Plan/ })).not.toBeDisabled());
+});
+
+test("queue stream snapshots update the main queue table", async () => {
+  render(<App />);
+  await screen.findByText("Source Setup");
+  await waitFor(() => expect(testHooks.queueMessageHandler).toBeDefined());
+  await act(async () => {
+    testHooks.queueMessageHandler?.({ type: "snapshot", data: queueSnapshot([queueItem("running", "streamed-1")], "running") });
+  });
+  expect(await screen.findByText("running", { exact: true })).toBeInTheDocument();
+});
+
+test("queue auxiliary window retries only failed and cancelled items", async () => {
+  const originalQueue = testData.queue;
+  testData.queue = queueSnapshot([
+    queueItem("failed", "failed-1"),
+    queueItem("cancelled", "cancelled-1"),
+    queueItem("queued", "queued-1"),
+  ]);
+  try {
+    window.history.pushState({}, "", "/?window=queue");
+    render(<App />);
+    await screen.findByRole("heading", { name: "Queue" });
+    const rows = await screen.findAllByRole("row");
+    fireEvent.click(within(rows[1]).getByRole("checkbox"));
+    fireEvent.click(within(rows[2]).getByRole("checkbox"));
+    fireEvent.click(within(rows[3]).getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(api.queueRetry).toHaveBeenCalledWith(["failed-1", "cancelled-1"]));
+  } finally {
+    testData.queue = originalQueue;
+  }
+});
+
+test("queue auxiliary window sends the requested reorder", async () => {
+  const originalQueue = testData.queue;
+  testData.queue = queueSnapshot([queueItem("queued", "queued-1"), queueItem("queued", "queued-2")]);
+  try {
+    window.history.pushState({}, "", "/?window=queue");
+    render(<App />);
+    await screen.findByRole("heading", { name: "Queue" });
+    const rows = await screen.findAllByRole("row");
+    fireEvent.click(within(rows[2]).getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+    await waitFor(() => expect(api.reorderQueue).toHaveBeenCalledWith(["queued-2", "queued-1"]));
+  } finally {
+    testData.queue = originalQueue;
+  }
+});
+
 test("preview sends options and opens the auxiliary result window", async () => {
   vi.mocked(api.preview).mockResolvedValue({
     success: true,
@@ -348,6 +432,17 @@ test("preview sends options and opens the auxiliary result window", async () => 
   await screen.findByRole("status");
   expect(api.preview).toHaveBeenCalledWith(expect.objectContaining({ inputPath: "/videos/source.mp4", outputDir: null }), expect.objectContaining({ sampleMode: "middle" }));
   expect(api.openAuxiliary).toHaveBeenCalledWith("preview");
+});
+
+test("preview errors are shown without opening the result window", async () => {
+  vi.mocked(api.preview).mockRejectedValueOnce(new Error("preview failed"));
+  render(<App />);
+  fireEvent.change(await screen.findByPlaceholderText("Select a source file or directory"), {
+    target: { value: "/videos/source.mp4" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: /^◇ Preview$/ }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("preview failed");
+  expect(api.openAuxiliary).not.toHaveBeenCalled();
 });
 
 test("preset manager loads, saves, and deletes a preset", async () => {

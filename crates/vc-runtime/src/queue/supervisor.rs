@@ -466,3 +466,33 @@ impl QueueSupervisor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn old_run_cleanup_does_not_clear_new_run_cancel_token() {
+        let supervisor = QueueSupervisor::new(ActivityHub::new());
+        let run_two_cancel = CancellationToken::new();
+        *supervisor.active_run.lock().await =
+            Some(ActiveRun { run_id: "run-1".into(), cancel: CancellationToken::new() });
+
+        // Hold the run-control lock so stale cleanup cannot pass the same
+        // serialization point as a new run. Install the replacement handle
+        // before releasing it, then let the old cleanup continue.
+        let control = supervisor.run_control.lock().await;
+        let cleanup = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.clear_active_run("run-1").await })
+        };
+        *supervisor.active_run.lock().await =
+            Some(ActiveRun { run_id: "run-2".into(), cancel: run_two_cancel.clone() });
+        drop(control);
+        cleanup.await.expect("cleanup task");
+
+        let active = supervisor.active_run.lock().await.clone().expect("new active run");
+        assert_eq!(active.run_id, "run-2");
+        assert!(!active.cancel.is_cancelled());
+    }
+}
