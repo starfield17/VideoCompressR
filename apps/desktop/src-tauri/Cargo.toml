@@ -22,7 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.8", features = [] }
 tauri-plugin-dialog = "2.4"
-ts-rs = "10.1"
+ts-rs = "12.0"
 tokio.workspace = true
 tokio-util.workspace = true
 vc-core = { path = "../../../crates/vc-core" }
