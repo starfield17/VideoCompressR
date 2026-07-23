@@ -11,7 +11,7 @@ export const config = {
   specs: [resolve(root, "e2e/**/*.e2e.mjs")],
   maxInstances: 1,
   capabilities: [{
-    browserName: "tauri",
+    browserName: "wry",
     "tauri:options": {
       application: resolve(root, "target/release/video-compressor-desktop"),
     },
