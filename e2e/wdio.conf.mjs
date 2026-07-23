@@ -12,6 +12,7 @@ export const config = {
   maxInstances: 1,
   capabilities: [{
     browserName: "wry",
+    "wdio:enforceWebDriverClassic": true,
     "tauri:options": {
       application: resolve(root, "target/release/video-compressor-desktop"),
     },
