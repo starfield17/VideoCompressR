@@ -479,7 +479,7 @@ fn queue_subscribe(
     channel
         .send(QueueStreamMessage::Snapshot(queue_snapshot_to_dto(&initial)))
         .map_err(|error| ApiErrorDto { code: "ipc".into(), message: error.to_string() })?;
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let mut receiver = receiver;
         while receiver.changed().await.is_ok() {
             let snapshot = receiver.borrow().as_ref().clone();
@@ -498,7 +498,7 @@ fn activity_subscribe(
     channel: Channel<QueueStreamMessage>,
 ) -> Result<(), ApiErrorDto> {
     let mut receiver = state.application.activity.subscribe();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         while let Ok(event) = receiver.recv().await {
             let message = QueueStreamMessage::Activity(ActivityEventDto {
                 category: event.category,
