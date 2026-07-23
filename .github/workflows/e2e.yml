@@ -82,7 +82,26 @@ jobs:
           GDK_BACKEND: x11
           WEBKIT_DISABLE_DMABUF_RENDERER: "1"
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
-        run: xvfb-run --auto-servernum pnpm --dir apps/desktop e2e
+        run: |
+          tauri_driver_log="${RUNNER_TEMP}/tauri-driver.log"
+          tauri_driver_pid=""
+          cleanup() {
+            if [ -n "$tauri_driver_pid" ]; then
+              kill "$tauri_driver_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          tauri-driver > "$tauri_driver_log" 2>&1 &
+          tauri_driver_pid=$!
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:4444/status >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:4444/status >/dev/null
+          pnpm --dir apps/desktop e2e
+        shell: xvfb-run --auto-servernum bash {0}
 
   browser:
     name: Browser-mode Playwright smoke
