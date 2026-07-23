@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Minimal desktop permissions for Video Compressor",
   "windows": ["main", "queue", "activity", "presets", "settings", "preview"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": ["core:default", "core:window:allow-close", "dialog:default"]
 }
