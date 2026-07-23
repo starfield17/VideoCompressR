@@ -169,11 +169,13 @@ async fn smoke(ffmpeg: &Path, encoder: &str) -> bool {
         args.extend(["-allow_sw", "0"]);
     }
     args.extend(["-f", "null", "-"]);
-    timeout(Duration::from_secs(10), run(ffmpeg, &args))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_some_and(|(code, _, _)| code == 0)
+    match timeout(Duration::from_secs(10), run(ffmpeg, &args)).await {
+        Ok(Ok((code, _, _))) if code == 0 => true,
+        result => {
+            eprintln!("FFmpeg capability smoke failed for {encoder}: {result:?}");
+            false
+        }
+    }
 }
 
 async fn detect_capabilities(tools: &ToolPaths) -> Result<CapabilitySnapshot, RuntimeError> {
