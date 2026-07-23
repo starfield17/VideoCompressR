@@ -195,9 +195,24 @@ function MainWindow() {
       };
       const result = addToQueue ? await api.addToQueue(request) : await api.plan(request);
       setPlan(result);
-      updateApp("lastSourcePath", source);
-      updateApp("lastOutputDir", output);
-      updateApp("recentPaths", [source, ...appSettings.recentPaths.filter((value) => value !== source)].slice(0, 10));
+      const nextAppSettings: AppSettingsDto = {
+        ...appSettings,
+        language,
+        lastSourcePath: source,
+        lastOutputDir: output,
+        recentPaths: [source, ...appSettings.recentPaths.filter((value) => value !== source)].slice(0, 10),
+      };
+      setAppSettings(nextAppSettings);
+      try {
+        await api.saveAppSettings(nextAppSettings);
+      } catch (error) {
+        setMessage(
+          t(
+            "gui.message.recent_paths_save_failed",
+            "Plan succeeded, but recent paths could not be saved: {error}",
+          ).replace("{error}", errorText(error)),
+        );
+      }
     } catch (error) {
       setMessage(errorText(error));
     } finally {

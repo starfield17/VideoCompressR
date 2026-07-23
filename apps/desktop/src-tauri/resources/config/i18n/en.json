@@ -180,6 +180,7 @@
   "gui.message.warning": "Warning",
   "gui.message.info": "Info",
   "gui.message.select_source": "Please select a source file or directory first.",
+  "gui.message.recent_paths_save_failed": "Plan succeeded, but recent paths could not be saved: {error}",
   "gui.message.no_queued_items": "There are no queued items ready to run.",
   "gui.message.no_running_queue": "There is no running queue to pause.",
   "gui.message.close_busy_title": "Tasks are still running",

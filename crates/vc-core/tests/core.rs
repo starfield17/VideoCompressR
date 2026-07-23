@@ -9,7 +9,8 @@ use vc_core::planning::{
     PlanningInput, choose_ratio, compute_target_video_bitrate, plan_item, unique_parallel_backends,
 };
 use vc_core::queue::{
-    ItemProgress, QueueCommand, QueueItemStatus, QueueRunState, QueueState, apply, compute_metrics,
+    ItemProgress, QueueCommand, QueueExecutionProfile, QueueItemStatus, QueueRunState, QueueState,
+    apply, compute_metrics, execution_profile, validate_queue_state,
 };
 
 fn media(path: &Path) -> MediaInfo {
@@ -37,6 +38,18 @@ fn planned(source: &str, output: &str) -> vc_core::EncodePlanItem {
         output_exists: false,
     })
     .expect("plan")
+}
+
+fn parallel_planned(
+    source: &str,
+    output: &str,
+    backends: Vec<EncoderBackend>,
+) -> vc_core::EncodePlanItem {
+    let mut item = planned(source, output);
+    item.settings.parallel_enabled = true;
+    item.settings.parallel_backends = backends;
+    item.settings.encoder_preset = None;
+    item
 }
 
 fn capabilities(entries: &[(EncoderBackend, &str)]) -> CapabilitySnapshot {
@@ -410,4 +423,155 @@ fn queue_reorder_moves_only_draft_and_queued_items() {
     let mut invalid = state.items.iter().map(|item| item.item_id.clone()).collect::<Vec<_>>();
     invalid.swap(0, 1);
     assert!(apply(&mut state, QueueCommand::Reorder { ordered_ids: invalid }).is_err());
+}
+
+#[test]
+fn queue_item_ids_remain_unique_after_remove_and_reenqueue() {
+    let mut state = QueueState::default();
+    apply(
+        &mut state,
+        QueueCommand::Enqueue(vec![
+            planned("same.mp4", "same-1.mp4"),
+            planned("same.mp4", "same-2.mp4"),
+        ]),
+    )
+    .expect("enqueue initial items");
+    let first_id = state.items[0].item_id.clone();
+    let second_id = state.items[1].item_id.clone();
+    apply(&mut state, QueueCommand::Remove { item_ids: vec![first_id] }).expect("remove first");
+    apply(&mut state, QueueCommand::Enqueue(vec![planned("same.mp4", "same-3.mp4")]))
+        .expect("reenqueue");
+    let ids = state.items.iter().map(|item| item.item_id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids, vec![second_id.clone(), "item-3".into()]);
+    assert_eq!(state.next_item_sequence, 3);
+    assert!(validate_queue_state(&state).is_ok());
+
+    apply(
+        &mut state,
+        QueueCommand::Reorder { ordered_ids: vec!["item-3".into(), second_id.clone()] },
+    )
+    .expect("reorder");
+    apply(&mut state, QueueCommand::StartRun { run_id: "run-1".into() }).expect("start");
+    apply(
+        &mut state,
+        QueueCommand::StartItem { item_id: second_id.clone(), run_id: "run-1".into() },
+    )
+    .expect("start item");
+    apply(
+        &mut state,
+        QueueCommand::Fail {
+            item_id: second_id.clone(),
+            run_id: "run-1".into(),
+            error: vc_core::queue::JobError { message: "fixture failure".into() },
+        },
+    )
+    .expect("fail item");
+    apply(&mut state, QueueCommand::RunIdle { run_id: "run-1".into() }).expect("idle");
+    apply(&mut state, QueueCommand::Retry { item_ids: vec![second_id.clone()] }).expect("retry");
+    assert_eq!(
+        state.items.iter().find(|item| item.item_id == second_id).map(|item| &item.status),
+        Some(&QueueItemStatus::Queued)
+    );
+    validate_queue_state(&state).expect("valid state after item operations");
+}
+
+#[test]
+fn run_idle_rejects_running_items() {
+    let mut state = QueueState::default();
+    apply(&mut state, QueueCommand::Enqueue(vec![planned("running.mp4", "out.mp4")]))
+        .expect("enqueue");
+    apply(&mut state, QueueCommand::StartRun { run_id: "run-1".into() }).expect("start");
+    let item_id = state.items[0].item_id.clone();
+    apply(&mut state, QueueCommand::StartItem { item_id, run_id: "run-1".into() })
+        .expect("start item");
+    assert_eq!(
+        apply(&mut state, QueueCommand::RunIdle { run_id: "run-1".into() }),
+        Err(vc_core::queue::QueueError::Busy)
+    );
+    assert_eq!(state.run_state, QueueRunState::Running);
+    validate_queue_state(&state).expect("state remains valid");
+}
+
+#[test]
+fn abort_run_fails_active_items_and_returns_idle() {
+    let mut state = QueueState::default();
+    apply(
+        &mut state,
+        QueueCommand::Enqueue(vec![
+            planned("one.mp4", "one.mp4.out"),
+            planned("two.mp4", "two.mp4.out"),
+        ]),
+    )
+    .expect("enqueue");
+    apply(&mut state, QueueCommand::StartRun { run_id: "run-1".into() }).expect("start");
+    for item_id in state.items.iter().map(|item| item.item_id.clone()).collect::<Vec<_>>() {
+        apply(&mut state, QueueCommand::StartItem { item_id, run_id: "run-1".into() })
+            .expect("start item");
+    }
+    apply(
+        &mut state,
+        QueueCommand::AbortRun { run_id: "run-1".into(), reason: "worker panicked".into() },
+    )
+    .expect("abort");
+    assert_eq!(state.run_state, QueueRunState::Idle);
+    assert_eq!(state.active_run_id, None);
+    assert!(state.items.iter().all(|item| {
+        item.status == QueueItemStatus::Failed
+            && item.error.as_ref().is_some_and(|error| error.message == "worker panicked")
+            && item.run_id.is_none()
+    }));
+    validate_queue_state(&state).expect("valid aborted state");
+}
+
+#[test]
+fn abort_run_rejects_stale_run() {
+    let mut state = QueueState::default();
+    apply(&mut state, QueueCommand::Enqueue(vec![planned("one.mp4", "out.mp4")])).expect("enqueue");
+    apply(&mut state, QueueCommand::StartRun { run_id: "run-1".into() }).expect("start");
+    assert_eq!(
+        apply(
+            &mut state,
+            QueueCommand::AbortRun { run_id: "old-run".into(), reason: "stale".into() },
+        ),
+        Err(vc_core::queue::QueueError::StaleRun)
+    );
+    assert_eq!(state.run_state, QueueRunState::Running);
+    assert_eq!(state.active_run_id.as_deref(), Some("run-1"));
+}
+
+#[test]
+fn queue_execution_profiles_normalize_duplicates_and_reject_mixes() {
+    let mut state = QueueState::default();
+    apply(
+        &mut state,
+        QueueCommand::Enqueue(vec![
+            parallel_planned("one.mp4", "one.out", vec![EncoderBackend::Cpu, EncoderBackend::Cpu]),
+            parallel_planned("two.mp4", "two.out", vec![EncoderBackend::Cpu]),
+        ]),
+    )
+    .expect("enqueue parallel");
+    assert_eq!(
+        execution_profile(&state).expect("profile"),
+        QueueExecutionProfile::Parallel { backends: vec![EncoderBackend::Cpu] }
+    );
+
+    let mut mixed = QueueState::default();
+    apply(
+        &mut mixed,
+        QueueCommand::Enqueue(vec![
+            planned("serial.mp4", "serial.out"),
+            parallel_planned("parallel.mp4", "parallel.out", vec![EncoderBackend::Cpu]),
+        ]),
+    )
+    .expect("enqueue mixed");
+    assert!(matches!(
+        execution_profile(&mixed),
+        Err(vc_core::queue::QueueError::IncompatibleExecutionProfile(_))
+    ));
+    assert!(matches!(
+        apply(&mut mixed, QueueCommand::StartRun { run_id: "run-1".into() }),
+        Err(vc_core::queue::QueueError::IncompatibleExecutionProfile(_))
+    ));
+    assert_eq!(mixed.run_state, QueueRunState::Idle);
+    assert_eq!(mixed.active_run_id, None);
 }

@@ -437,8 +437,7 @@ async fn queue_pause_after_current(state: State<'_, AppRuntime>) -> Result<(), A
 
 #[tauri::command]
 async fn queue_stop(state: State<'_, AppRuntime>) -> Result<(), ApiErrorDto> {
-    state.application.queue.stop().await;
-    Ok(())
+    state.application.queue.stop().await.map_err(api_error)
 }
 
 #[tauri::command]
@@ -677,7 +676,7 @@ pub fn run() {
                 let window = window.clone();
                 let close_pending = close_pending_for_event.clone();
                 tauri::async_runtime::spawn(async move {
-                    application.queue.stop().await;
+                    let _ = application.queue.stop().await;
                     loop {
                         let snapshot = application.queue.snapshot().await;
                         if snapshot.state.run_state == vc_core::queue::QueueRunState::Idle {

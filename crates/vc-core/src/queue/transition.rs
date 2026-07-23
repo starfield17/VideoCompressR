@@ -1,7 +1,11 @@
 use super::{
-    ItemProgress, ItemResult, JobError, QueueItem, QueueItemStatus, QueueRunState, QueueState,
+    ItemProgress, ItemResult, JobError, QueueExecutionProfile, QueueItem, QueueItemStatus,
+    QueueRunState, QueueState,
 };
 use crate::model::EncodePlanItem;
+use crate::model::EncoderBackend;
+use crate::planning::unique_parallel_backends;
+use std::collections::HashSet;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -16,6 +20,7 @@ pub enum QueueCommand {
     PauseAfterCurrent,
     PauseComplete { run_id: String },
     CancelRun { run_id: String },
+    AbortRun { run_id: String, reason: String },
     RunIdle { run_id: String },
     Retry { item_ids: Vec<String> },
     Remove { item_ids: Vec<String> },
@@ -35,6 +40,10 @@ pub enum QueueError {
     StaleRun,
     #[error("reorder list does not match queued items")]
     InvalidOrder,
+    #[error("incompatible queued execution profiles: {0}")]
+    IncompatibleExecutionProfile(String),
+    #[error("queue state invariant violated: {0}")]
+    Invariant(String),
 }
 
 fn item_mut<'a>(state: &'a mut QueueState, id: &str) -> Result<&'a mut QueueItem, QueueError> {
@@ -59,29 +68,166 @@ fn check_active_run(state: &QueueState, run_id: &str) -> Result<(), QueueError> 
     Ok(())
 }
 
+fn item_sequence(item_id: &str) -> Option<u64> {
+    item_id.strip_prefix("item-")?.split('-').next()?.parse().ok()
+}
+
+fn max_item_sequence(state: &QueueState) -> u64 {
+    state.items.iter().filter_map(|item| item_sequence(&item.item_id)).max().unwrap_or(0)
+}
+
+fn profile_for_item(item: &QueueItem) -> Result<QueueExecutionProfile, QueueError> {
+    if !item.plan.settings.parallel_enabled {
+        return Ok(QueueExecutionProfile::Serial);
+    }
+    let backends = unique_parallel_backends(&item.plan.settings.parallel_backends)
+        .into_iter()
+        .filter(|backend| *backend != EncoderBackend::Auto)
+        .collect::<Vec<_>>();
+    if backends.is_empty() {
+        return Err(QueueError::IncompatibleExecutionProfile(
+            "Parallel mode requires at least one explicit backend.".into(),
+        ));
+    }
+    Ok(QueueExecutionProfile::Parallel { backends })
+}
+
+pub fn execution_profile(state: &QueueState) -> Result<QueueExecutionProfile, QueueError> {
+    let mut queued = state.items.iter().filter(|item| item.status == QueueItemStatus::Queued);
+    let Some(first) = queued.next() else {
+        return Err(QueueError::Illegal {
+            item_id: String::new(),
+            message: "no queued items".into(),
+        });
+    };
+    let profile = profile_for_item(first)?;
+    for item in queued {
+        if profile_for_item(item)? != profile {
+            return Err(QueueError::IncompatibleExecutionProfile(
+                "Queued items use incompatible execution modes. Remove or reconfigure items before starting.".into(),
+            ));
+        }
+    }
+    Ok(profile)
+}
+
+pub fn validate_queue_state(state: &QueueState) -> Result<(), QueueError> {
+    let mut ids = HashSet::with_capacity(state.items.len());
+    for item in &state.items {
+        if !ids.insert(&item.item_id) {
+            return Err(QueueError::Invariant(format!("duplicate item id: {}", item.item_id)));
+        }
+    }
+
+    let active_required = matches!(
+        state.run_state,
+        QueueRunState::Running | QueueRunState::PauseRequested | QueueRunState::Cancelling
+    );
+    if active_required != state.active_run_id.is_some() {
+        return Err(QueueError::Invariant(
+            "active_run_id must exist exactly while the queue is active".into(),
+        ));
+    }
+    if matches!(state.run_state, QueueRunState::Idle | QueueRunState::Paused)
+        && state.items.iter().any(|item| item.status == QueueItemStatus::Running)
+    {
+        return Err(QueueError::Invariant("idle or paused queue contains a running item".into()));
+    }
+
+    for item in &state.items {
+        if item.status == QueueItemStatus::Running {
+            if item.run_id.as_deref() != state.active_run_id.as_deref() {
+                return Err(QueueError::Invariant(format!(
+                    "running item {} does not belong to the active run",
+                    item.item_id
+                )));
+            }
+        } else if item.run_id.is_some() {
+            return Err(QueueError::Invariant(format!(
+                "non-running item {} retains a run id",
+                item.item_id
+            )));
+        }
+        if matches!(item.status, QueueItemStatus::Done | QueueItemStatus::Skipped)
+            && item.progress.percent != 100.0
+        {
+            return Err(QueueError::Invariant(format!(
+                "completed item {} is not at 100 percent",
+                item.item_id
+            )));
+        }
+        if matches!(item.status, QueueItemStatus::Failed | QueueItemStatus::Cancelled)
+            && item.error.is_none()
+        {
+            return Err(QueueError::Invariant(format!(
+                "failed or cancelled item {} has no error",
+                item.item_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueError> {
+    let is_progress = matches!(&command, QueueCommand::ReportProgress { .. });
+    if is_progress {
+        apply_unchecked(state, command)?;
+        return validate_queue_state(state);
+    }
+    let mut next = state.clone();
+    apply_unchecked(&mut next, command)?;
+    validate_queue_state(&next)?;
+    *state = next;
+    Ok(())
+}
+
+fn apply_unchecked(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueError> {
     match command {
         QueueCommand::Enqueue(plans) => {
             if !matches!(state.run_state, QueueRunState::Idle | QueueRunState::Paused) {
                 return Err(QueueError::Busy);
             }
-            let start = state.items.len();
-            state.items.extend(plans.into_iter().enumerate().map(|(offset, plan)| QueueItem {
-                item_id: format!("item-{}-{}", start + offset + 1, plan.source_path.display()),
-                status: if plan.skip_reason.is_some() {
-                    QueueItemStatus::Skipped
-                } else {
-                    QueueItemStatus::Queued
-                },
-                progress: ItemProgress {
-                    percent: if plan.skip_reason.is_some() { 100.0 } else { 0.0 },
-                    ..ItemProgress::default()
-                },
-                error: plan.skip_reason.as_ref().map(|value| JobError { message: value.0.clone() }),
-                result: None,
-                run_id: None,
-                plan,
-            }));
+            let mut sequence = state.next_item_sequence.max(max_item_sequence(state));
+            let mut ids =
+                state.items.iter().map(|item| item.item_id.clone()).collect::<HashSet<_>>();
+            let mut new_items = Vec::with_capacity(plans.len());
+            for plan in plans {
+                sequence = sequence.checked_add(1).ok_or_else(|| QueueError::Illegal {
+                    item_id: String::new(),
+                    message: "queue item sequence overflow".into(),
+                })?;
+                let item_id = loop {
+                    let candidate = format!("item-{sequence}");
+                    if ids.insert(candidate.clone()) {
+                        break candidate;
+                    }
+                    sequence = sequence.checked_add(1).ok_or_else(|| QueueError::Illegal {
+                        item_id: String::new(),
+                        message: "queue item sequence overflow".into(),
+                    })?;
+                };
+                new_items.push(QueueItem {
+                    item_id,
+                    status: if plan.skip_reason.is_some() {
+                        QueueItemStatus::Skipped
+                    } else {
+                        QueueItemStatus::Queued
+                    },
+                    progress: ItemProgress {
+                        percent: if plan.skip_reason.is_some() { 100.0 } else { 0.0 },
+                        ..ItemProgress::default()
+                    },
+                    error: plan
+                        .skip_reason
+                        .as_ref()
+                        .map(|value| JobError { message: value.0.clone() }),
+                    result: None,
+                    run_id: None,
+                    plan,
+                });
+            }
+            state.next_item_sequence = sequence;
+            state.items.extend(new_items);
         }
         QueueCommand::StartRun { run_id } => {
             if run_id.is_empty() {
@@ -96,6 +242,7 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
                     message: "no queued items".into(),
                 });
             }
+            execution_profile(state)?;
             state.run_state = QueueRunState::Running;
             state.active_run_id = Some(run_id);
         }
@@ -142,6 +289,12 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
             } else if result.success {
                 QueueItemStatus::Done
             } else {
+                item.error = Some(JobError {
+                    message: result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Queue item execution failed.".into()),
+                });
                 QueueItemStatus::Failed
             };
             item.progress.percent = 100.0;
@@ -191,16 +344,40 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
                 return Err(QueueError::Busy);
             }
             state.run_state = QueueRunState::Paused;
+            state.active_run_id = None;
         }
         QueueCommand::CancelRun { run_id } => {
             check_active_run(state, &run_id)?;
-            if !matches!(state.run_state, QueueRunState::Running | QueueRunState::PauseRequested) {
+            if !matches!(
+                state.run_state,
+                QueueRunState::Running | QueueRunState::PauseRequested | QueueRunState::Cancelling
+            ) {
                 return Err(QueueError::Busy);
             }
             state.run_state = QueueRunState::Cancelling;
         }
+        QueueCommand::AbortRun { run_id, reason } => {
+            check_active_run(state, &run_id)?;
+            for item in &mut state.items {
+                if item.status == QueueItemStatus::Running
+                    && item.run_id.as_deref() == Some(run_id.as_str())
+                {
+                    item.status = QueueItemStatus::Failed;
+                    item.error = Some(JobError { message: reason.clone() });
+                    item.run_id = None;
+                }
+            }
+            state.run_state = QueueRunState::Idle;
+            state.active_run_id = None;
+        }
         QueueCommand::RunIdle { run_id } => {
             check_active_run(state, &run_id)?;
+            if state.items.iter().any(|item| {
+                item.status == QueueItemStatus::Running
+                    && item.run_id.as_deref() == Some(run_id.as_str())
+            }) {
+                return Err(QueueError::Busy);
+            }
             state.run_state = QueueRunState::Idle;
             state.active_run_id = None;
         }

@@ -11,3 +11,9 @@ test("browser mode renders a stable main-window screenshot", async ({ page }, te
   await testInfo.attach("main-window.png", { body: screenshot, contentType: "image/png" });
   expect(screenshot.byteLength).toBeGreaterThan(1_000);
 });
+
+test("browser mode validates source selection before invoking the runtime", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: /Plan/ }).click();
+  await expect(page.getByRole("alert")).toContainText("select a source");
+});

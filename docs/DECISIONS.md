@@ -37,3 +37,20 @@ command. The React API client imports the checked-in generated file, and
 `pnpm codegen:check` compares a temporary regeneration without mutating the
 checkout, so command payload changes fail at the Rust/TypeScript boundary
 instead of relying on duplicated handwritten types.
+
+## D-0007: Queue invariants are validated at reducer boundaries
+
+Queue state is validated after every reducer command. Commands operate on a
+structural clone and replace the state only after validation; the high-volume
+progress command updates in place and validates immediately. This keeps
+invalid lifecycle combinations out of published snapshots without adding a
+second state model or a speculative event-sourcing layer.
+
+## D-0008: A queue run has one normalized execution profile
+
+`StartRun` accepts only queued items with one normalized profile: either all
+serial or all parallel with the same deduplicated explicit backend set.
+Validation happens before the run identifier is assigned, so a rejected mixed
+queue cannot partially start workers. Parallel scheduling consumes the
+validated profile rather than re-deriving it from whichever item a worker sees
+first.

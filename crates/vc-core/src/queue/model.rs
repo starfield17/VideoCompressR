@@ -1,4 +1,4 @@
-use crate::model::EncodePlanItem;
+use crate::model::{EncodePlanItem, EncoderBackend};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,7 +69,15 @@ pub struct QueueState {
     pub run_state: QueueRunState,
     #[serde(default)]
     pub active_run_id: Option<String>,
+    #[serde(default)]
+    pub next_item_sequence: u64,
     pub items: Vec<QueueItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueueExecutionProfile {
+    Serial,
+    Parallel { backends: Vec<EncoderBackend> },
 }
 
 #[allow(clippy::derivable_impls)]

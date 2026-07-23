@@ -2,8 +2,18 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the generated release assets"
+        required: true
+        type: boolean
+        default: false
   push:
     tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -31,6 +41,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@cargo-deny
+      - name: Run dependency policy checks
+        run: cargo deny check
       - name: Check portable checksum helper
         shell: bash
         run: |
@@ -74,6 +86,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@cargo-deny
+      - name: Run dependency policy checks
+        run: cargo deny check
       - name: Install Tauri Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -122,7 +136,7 @@ jobs:
     name: Publish release assets
     needs: [cli, desktop]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.publish)
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -130,7 +144,11 @@ jobs:
           merge-multiple: true
       - name: Combine checksums and record unsigned state
         run: |
-          find release-assets -type f -name '*.sha256' -print0 | xargs -0 cat > release-assets/SHA256SUMS
+          set -euo pipefail
+          shopt -s nullglob
+          checksums=(release-assets/*.sha256)
+          test "${#checksums[@]}" -gt 0
+          cat "${checksums[@]}" > release-assets/SHA256SUMS
           echo 'signing=unsigned' > release-assets/SIGNING_STATUS.txt
       - uses: softprops/action-gh-release@v3
         with:

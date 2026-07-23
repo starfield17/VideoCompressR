@@ -77,17 +77,27 @@ impl PlanningService {
                 request.settings.codec,
                 request.settings.container,
             );
-            let media = probe_media_info(&tools.ffprobe, &file.path).await?;
-            let item = plan_item(PlanningInput {
-                source: media,
-                output_path: output.clone(),
-                settings: request.settings.clone(),
-                capabilities: capabilities.clone(),
-                output_exists: output.exists(),
-            });
-            items.push(item.unwrap_or_else(|reason| {
-                skipped_item(file.path, output, request.settings.clone(), reason)
-            }));
+            match probe_media_info(&tools.ffprobe, &file.path).await {
+                Ok(media) => {
+                    let item = plan_item(PlanningInput {
+                        source: media,
+                        output_path: output.clone(),
+                        settings: request.settings.clone(),
+                        capabilities: capabilities.clone(),
+                        output_exists: output.exists(),
+                    });
+                    items.push(item.unwrap_or_else(|reason| {
+                        skipped_item(file.path, output, request.settings.clone(), reason)
+                    }));
+                }
+                Err(error) if input_is_file => return Err(error),
+                Err(error) => items.push(skipped_item(
+                    file.path,
+                    output,
+                    request.settings.clone(),
+                    error.to_string(),
+                )),
+            }
         }
         Ok(EncodePlan {
             items,

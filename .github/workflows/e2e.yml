@@ -2,11 +2,24 @@ name: Desktop E2E
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/desktop/**"
+      - "crates/**"
+      - "e2e/**"
+      - "fixtures/fake-tools/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
   pull_request:
     paths:
       - "apps/desktop/**"
       - "crates/**"
       - "e2e/**"
+      - "fixtures/fake-tools/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
 
 permissions:
   contents: read
@@ -32,6 +45,38 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: cargo build --locked --release --features tauri/custom-protocol -p video-compressor-desktop
+      - name: Prepare deterministic Tauri runtime data
+        run: |
+          e2e_data_dir="${RUNNER_TEMP}/video-compressor-e2e"
+          mkdir -p "$e2e_data_dir/config" "$e2e_data_dir/workdir"
+          printf 'fixture' > "$e2e_data_dir/e2e-input.mp4"
+          export VIDEO_COMPRESSOR_DATA_DIR="$e2e_data_dir"
+          export E2E_SOURCE_PATH="$e2e_data_dir/e2e-input.mp4"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          data_dir = Path(os.environ["VIDEO_COMPRESSOR_DATA_DIR"])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          config = {
+              "schema_version": 2,
+              "default_preset_name": "default_hevc",
+              "keep_preview_temp": True,
+              "recent_paths": [],
+              "language": "en",
+              "last_source_path": "",
+              "last_output_dir": "",
+              "workdir_path": "",
+              "ffmpeg_path": str(workspace / "fixtures/fake-tools/fake-queue-hang.sh"),
+              "ffprobe_path": str(workspace / "fixtures/fake-tools/fake-ffprobe.sh"),
+              "log_level": "info",
+              "queue_table_header_state": "",
+          }
+          (data_dir / "config/app_config.json").write_text(json.dumps(config), encoding="utf-8")
+          PY
+          echo "VIDEO_COMPRESSOR_DATA_DIR=$e2e_data_dir" >> "$GITHUB_ENV"
+          echo "E2E_SOURCE_PATH=$e2e_data_dir/e2e-input.mp4" >> "$GITHUB_ENV"
       - name: Run WebdriverIO Tauri smoke test
         run: xvfb-run --auto-servernum pnpm --dir apps/desktop e2e
 

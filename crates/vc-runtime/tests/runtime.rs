@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
-use vc_core::queue::{QueueItemStatus, QueueRunState};
+use vc_core::queue::{QueueItemStatus, QueueRunState, validate_queue_state};
 use vc_core::{
     EncodePlanItem, EncodeSettings, EncoderBackend, PreviewJob, PreviewOptions, PreviewSampleMode,
     choose_sample_window,
@@ -69,6 +69,7 @@ async fn parallel_items(
 async fn wait_for_idle(
     supervisor: &QueueSupervisor,
 ) -> vc_runtime::queue::supervisor::QueueSnapshot {
+    let mut receiver = supervisor.subscribe();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let snapshot = supervisor.snapshot().await;
@@ -88,7 +89,27 @@ async fn wait_for_idle(
                 .map(|item| (&item.status, &item.run_id))
                 .collect::<Vec<_>>()
         );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            tokio::time::timeout(remaining, receiver.changed()).await.is_ok(),
+            "queue did not become idle before the deadline"
+        );
+    }
+}
+
+async fn wait_for_running(supervisor: &QueueSupervisor) {
+    let mut receiver = supervisor.subscribe();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let snapshot = supervisor.snapshot().await;
+        if snapshot.metrics.running_items >= 1 {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            tokio::time::timeout(remaining, receiver.changed()).await.is_ok(),
+            "parallel queue did not start an item before the deadline"
+        );
     }
 }
 
@@ -216,6 +237,44 @@ async fn fake_tools_produce_a_real_runtime_plan_without_reference_tree() {
         .collect::<Vec<_>>();
     assert!(flattened.windows(2).any(|window| window == ["-progress", "pipe:1"]));
     assert!(flattened.iter().any(|value| value.contains("movie with space.mp4")));
+}
+
+#[tokio::test]
+async fn directory_plan_skips_one_probe_failure_and_continues() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let input = temp.path().join("directory");
+    std::fs::create_dir(&input).expect("input directory");
+    for name in ["valid-a.mp4", "broken.mp4", "valid-b.mp4"] {
+        std::fs::write(input.join(name), b"fixture").expect("source");
+    }
+
+    let plan = PlanningService::new(paths.clone())
+        .plan(PlanRequest {
+            input_path: input,
+            output_dir: Some(temp.path().join("out")),
+            workdir: None,
+            ffmpeg_path: Some(fake("fake-ffmpeg")),
+            ffprobe_path: Some(fake("fake-ffprobe-directory")),
+            settings: EncodeSettings {
+                backend: EncoderBackend::Cpu,
+                overwrite: true,
+                ..EncodeSettings::default()
+            },
+            force_capability_refresh: true,
+        })
+        .await
+        .expect("directory plan");
+
+    assert_eq!(plan.items.len(), 3);
+    assert_eq!(plan.items.iter().filter(|item| item.is_ready()).count(), 2);
+    let skipped =
+        plan.items.iter().find(|item| item.skip_reason.is_some()).expect("broken item skipped");
+    assert!(skipped.source_path.ends_with("broken.mp4"));
+    assert!(
+        skipped.skip_reason.as_ref().expect("skip reason").0.contains("ffprobe fixture failure")
+    );
 }
 
 #[tokio::test]
@@ -536,6 +595,38 @@ async fn parallel_item_failure_does_not_cancel_other_workers() {
 }
 
 #[tokio::test]
+async fn worker_failure_cannot_leave_idle_with_running_items() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let mut items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg"),
+        &["worker-error.mp4"],
+        vec![EncoderBackend::Cpu],
+    )
+    .await;
+    let blocked_parent = paths.root.join("blocked-parent");
+    std::fs::write(&blocked_parent, b"not a directory").expect("blocked parent");
+    items[0].output_path = blocked_parent.join("output.mp4");
+
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    supervisor
+        .start(ExecutionContext {
+            paths: paths.clone(),
+            tools: ToolPaths { ffmpeg: fake("fake-ffmpeg"), ffprobe: fake("fake-ffprobe") },
+            activity: ActivityHub::new(),
+        })
+        .await
+        .expect("start");
+    let snapshot = wait_for_idle(&supervisor).await;
+    assert_eq!(snapshot.metrics.failed_items, 1);
+    assert!(snapshot.state.items.iter().all(|item| item.status != QueueItemStatus::Running));
+    validate_queue_state(&snapshot.state).expect("valid state after worker failure");
+}
+
+#[tokio::test]
 async fn direct_parallel_execution_keeps_successful_items_after_failure() {
     let temp = tempfile::tempdir().expect("temp");
     let paths = AppPaths::from_root(temp.path());
@@ -617,27 +708,161 @@ async fn queue_stop_cancels_all_active_parallel_workers() {
         })
         .await
         .expect("start");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let snapshot = supervisor.snapshot().await;
-        if snapshot.metrics.running_items >= 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "parallel queue did not start an item before stop: state={:?}, items={:?}",
-            snapshot.state.run_state,
-            snapshot
-                .state
-                .items
-                .iter()
-                .map(|item| (&item.status, &item.run_id))
-                .collect::<Vec<_>>()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    supervisor.stop().await;
+    wait_for_running(&supervisor).await;
+    supervisor.stop().await.expect("stop");
     let snapshot = wait_for_idle(&supervisor).await;
     assert!(snapshot.state.items.iter().all(|item| item.status != QueueItemStatus::Running));
     assert!(snapshot.metrics.cancelled_items >= 1);
+}
+
+#[tokio::test]
+async fn mixed_serial_and_parallel_queue_is_rejected_before_start() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let mut items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg"),
+        &["serial.mp4", "parallel.mp4"],
+        vec![EncoderBackend::Cpu],
+    )
+    .await;
+    items[0].settings.parallel_enabled = false;
+    items[0].settings.parallel_backends.clear();
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    let error = supervisor
+        .start(ExecutionContext {
+            paths: paths.clone(),
+            tools: ToolPaths { ffmpeg: fake("fake-ffmpeg"), ffprobe: fake("fake-ffprobe") },
+            activity: ActivityHub::new(),
+        })
+        .await
+        .expect_err("mixed queue must be rejected");
+    assert!(error.to_string().contains("incompatible execution modes"));
+    let snapshot = supervisor.snapshot().await;
+    assert_eq!(snapshot.state.run_state, QueueRunState::Idle);
+    assert_eq!(snapshot.state.active_run_id, None);
+    assert!(snapshot.state.items.iter().all(|item| item.status == QueueItemStatus::Queued));
+    validate_queue_state(&snapshot.state).expect("valid rejected queue state");
+}
+
+#[tokio::test]
+async fn different_parallel_backend_sets_are_rejected_before_start() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let mut items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg"),
+        &["one.mp4", "two.mp4"],
+        vec![EncoderBackend::Cpu, EncoderBackend::Qsv],
+    )
+    .await;
+    items[1].settings.parallel_backends = vec![EncoderBackend::Cpu];
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    let error = supervisor
+        .start(ExecutionContext {
+            paths: paths.clone(),
+            tools: ToolPaths { ffmpeg: fake("fake-ffmpeg"), ffprobe: fake("fake-ffprobe") },
+            activity: ActivityHub::new(),
+        })
+        .await
+        .expect_err("different backend sets must be rejected");
+    assert!(error.to_string().contains("incompatible execution modes"));
+    assert_eq!(supervisor.snapshot().await.state.run_state, QueueRunState::Idle);
+}
+
+#[tokio::test]
+async fn same_parallel_backends_in_different_duplicate_forms_are_normalized() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let mut items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg"),
+        &["one.mp4", "two.mp4"],
+        vec![EncoderBackend::Cpu, EncoderBackend::Cpu],
+    )
+    .await;
+    items[1].settings.parallel_backends = vec![EncoderBackend::Cpu];
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    supervisor
+        .start(ExecutionContext {
+            paths: paths.clone(),
+            tools: ToolPaths { ffmpeg: fake("fake-ffmpeg"), ffprobe: fake("fake-ffprobe") },
+            activity: ActivityHub::new(),
+        })
+        .await
+        .expect("normalized parallel queue starts");
+    let snapshot = wait_for_idle(&supervisor).await;
+    assert_eq!(snapshot.metrics.done_items, 2);
+    validate_queue_state(&snapshot.state).expect("valid completed queue");
+}
+
+#[tokio::test]
+async fn all_serial_items_start() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let mut items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg"),
+        &["one.mp4", "two.mp4"],
+        vec![EncoderBackend::Cpu],
+    )
+    .await;
+    for item in &mut items {
+        item.settings.parallel_enabled = false;
+        item.settings.parallel_backends.clear();
+    }
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    supervisor
+        .start(ExecutionContext {
+            paths: paths.clone(),
+            tools: ToolPaths { ffmpeg: fake("fake-ffmpeg"), ffprobe: fake("fake-ffprobe") },
+            activity: ActivityHub::new(),
+        })
+        .await
+        .expect("serial queue starts");
+    let snapshot = wait_for_idle(&supervisor).await;
+    assert_eq!(snapshot.metrics.done_items, 2);
+}
+
+#[tokio::test]
+async fn old_run_cleanup_does_not_clear_new_run_cancel_token() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let mut items =
+        parallel_items(&paths, fake("fake-ffmpeg"), &["run-again.mp4"], vec![EncoderBackend::Cpu])
+            .await;
+    items[0].settings.parallel_enabled = false;
+    items[0].settings.parallel_backends.clear();
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    let context = || ExecutionContext {
+        paths: paths.clone(),
+        tools: ToolPaths { ffmpeg: fake("fake-queue-hang"), ffprobe: fake("fake-ffprobe") },
+        activity: ActivityHub::new(),
+    };
+
+    supervisor.start(context()).await.expect("first start");
+    wait_for_running(&supervisor).await;
+    supervisor.stop().await.expect("first stop");
+    let first = wait_for_idle(&supervisor).await;
+    let item_id = first.state.items[0].item_id.clone();
+    assert_eq!(first.state.items[0].status, QueueItemStatus::Cancelled);
+
+    supervisor.retry(vec![item_id]).await.expect("retry");
+    supervisor.start(context()).await.expect("second start");
+    wait_for_running(&supervisor).await;
+    supervisor.stop().await.expect("second stop");
+    let second = wait_for_idle(&supervisor).await;
+    assert_eq!(second.metrics.cancelled_items, 1);
+    assert!(second.state.items.iter().all(|item| item.status != QueueItemStatus::Running));
+    validate_queue_state(&second.state).expect("valid state after consecutive runs");
 }

@@ -45,6 +45,7 @@ cargo metadata --format-version 1 --locked > "$stage/SBOM.cargo-metadata.json"
   printf 'source_date_epoch=%s\n' "${SOURCE_DATE_EPOCH:-unset}"
   printf '%s\n' 'ffmpeg_bundle=none (thin artifact; provide matching external ffmpeg/ffprobe)'
 } > "$stage/BUILD_INFO.txt"
+printf '%s\n' 'signing=unsigned' > "$stage/SIGNING_STATUS.txt"
 
 if [[ "$target" == *-windows-* ]]; then
   archive="${output_dir}/${name}.zip"

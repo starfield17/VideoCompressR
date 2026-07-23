@@ -9,9 +9,9 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use vc_core::EncodePlanItem;
-use vc_core::planning::unique_parallel_backends;
 use vc_core::queue::{
-    ItemProgress, QueueCommand, QueueMetrics, QueueState, apply, compute_metrics,
+    ItemProgress, QueueCommand, QueueError, QueueExecutionProfile, QueueMetrics, QueueState, apply,
+    compute_metrics, execution_profile,
 };
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -28,11 +28,18 @@ pub struct ExecutionContext {
 }
 
 #[derive(Clone)]
+struct ActiveRun {
+    run_id: String,
+    cancel: CancellationToken,
+}
+
+#[derive(Clone)]
 pub struct QueueSupervisor {
     state: Arc<Mutex<QueueState>>,
     snapshots: watch::Sender<Arc<QueueSnapshot>>,
     hub: ActivityHub,
-    active_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    active_run: Arc<Mutex<Option<ActiveRun>>>,
+    run_control: Arc<Mutex<()>>,
     workdir: Arc<Mutex<Option<PathBuf>>>,
 }
 
@@ -45,7 +52,8 @@ impl QueueSupervisor {
             state: Arc::new(Mutex::new(QueueState::default())),
             snapshots,
             hub,
-            active_cancel: Arc::new(Mutex::new(None)),
+            active_run: Arc::new(Mutex::new(None)),
+            run_control: Arc::new(Mutex::new(())),
             workdir: Arc::new(Mutex::new(None)),
         }
     }
@@ -82,45 +90,60 @@ impl QueueSupervisor {
     pub async fn pause_after_current(&self) -> Result<(), RuntimeError> {
         self.apply(QueueCommand::PauseAfterCurrent).await
     }
-    pub async fn stop(&self) {
-        let token = self.active_cancel.lock().await.clone();
-        if let Some(token) = token {
-            token.cancel();
-        }
-        let (state, run_id) = {
-            let state = self.state.lock().await;
-            (state.run_state.clone(), state.active_run_id.clone())
+    pub async fn stop(&self) -> Result<(), RuntimeError> {
+        let _control = self.run_control.lock().await;
+        let Some(active) = self.active_run.lock().await.clone() else {
+            return Ok(());
         };
-        if matches!(
-            state,
-            vc_core::queue::QueueRunState::Running | vc_core::queue::QueueRunState::PauseRequested
-        ) {
-            if let Some(run_id) = run_id {
-                let _ = self.apply(QueueCommand::CancelRun { run_id }).await;
-            }
+        active.cancel.cancel();
+        match self.apply(QueueCommand::CancelRun { run_id: active.run_id }).await {
+            Ok(()) | Err(RuntimeError::Queue(QueueError::StaleRun)) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
     pub async fn start(&self, mut context: ExecutionContext) -> Result<(), RuntimeError> {
+        let _control = self.run_control.lock().await;
         if let Some(workdir) = self.workdir.lock().await.clone() {
             context.paths = context.paths.for_workdir(&workdir);
             context.paths.ensure()?;
         }
+        let profile = {
+            let state = self.state.lock().await;
+            execution_profile(&state)?
+        };
         let run_id = uuid::Uuid::new_v4().to_string();
         self.apply(QueueCommand::StartRun { run_id: run_id.clone() }).await?;
         let cancel = CancellationToken::new();
-        *self.active_cancel.lock().await = Some(cancel.clone());
+        *self.active_run.lock().await =
+            Some(ActiveRun { run_id: run_id.clone(), cancel: cancel.clone() });
         let supervisor = self.clone();
         let cleanup_run_id = run_id.clone();
         tokio::spawn(async move {
-            let result = supervisor.run_loop(context, run_id, cancel.clone()).await;
+            let result = supervisor.run_loop(context, run_id, cancel.clone(), profile).await;
             if let Err(error) = result {
                 supervisor.hub.emit("error", error.to_string());
-                let _ = supervisor.apply(QueueCommand::RunIdle { run_id: cleanup_run_id }).await;
+                if let Err(abort_error) = supervisor
+                    .apply(QueueCommand::AbortRun {
+                        run_id: cleanup_run_id.clone(),
+                        reason: error.to_string(),
+                    })
+                    .await
+                {
+                    supervisor.hub.emit("error", abort_error.to_string());
+                }
             }
-            *supervisor.active_cancel.lock().await = None;
+            supervisor.clear_active_run(&cleanup_run_id).await;
         });
         Ok(())
+    }
+
+    async fn clear_active_run(&self, run_id: &str) {
+        let _control = self.run_control.lock().await;
+        let mut active = self.active_run.lock().await;
+        if active.as_ref().is_some_and(|value| value.run_id == run_id) {
+            *active = None;
+        }
     }
 
     async fn run_loop(
@@ -128,23 +151,11 @@ impl QueueSupervisor {
         context: ExecutionContext,
         run_id: String,
         cancel: CancellationToken,
+        profile: QueueExecutionProfile,
     ) -> Result<(), RuntimeError> {
-        let parallel = {
-            self.state
-                .lock()
-                .await
-                .items
-                .iter()
-                .find(|item| item.status == vc_core::queue::QueueItemStatus::Queued)
-                .is_some_and(|item| item.plan.settings.parallel_enabled)
-        };
-        if parallel {
-            self.run_parallel_loop(context, run_id.clone(), cancel.clone()).await?;
-            if self.state.lock().await.run_state == vc_core::queue::QueueRunState::PauseRequested {
-                let _ = self.apply(QueueCommand::PauseComplete { run_id: run_id.clone() }).await;
-            } else {
-                let _ = self.apply(QueueCommand::RunIdle { run_id }).await;
-            }
+        if let QueueExecutionProfile::Parallel { backends } = profile {
+            self.run_parallel_loop(context, run_id.clone(), cancel.clone(), backends).await?;
+            self.finish_run(&run_id).await?;
             return Ok(());
         }
         let ids = {
@@ -246,12 +257,16 @@ impl QueueSupervisor {
                 }
             }
         }
-        if self.state.lock().await.run_state == vc_core::queue::QueueRunState::PauseRequested {
-            let _ = self.apply(QueueCommand::PauseComplete { run_id: run_id.clone() }).await;
-        } else {
-            let _ = self.apply(QueueCommand::RunIdle { run_id }).await;
-        }
+        self.finish_run(&run_id).await?;
         Ok(())
+    }
+
+    async fn finish_run(&self, run_id: &str) -> Result<(), RuntimeError> {
+        if self.state.lock().await.run_state == vc_core::queue::QueueRunState::PauseRequested {
+            self.apply(QueueCommand::PauseComplete { run_id: run_id.into() }).await
+        } else {
+            self.apply(QueueCommand::RunIdle { run_id: run_id.into() }).await
+        }
     }
 
     async fn run_parallel_loop(
@@ -259,42 +274,17 @@ impl QueueSupervisor {
         context: ExecutionContext,
         run_id: String,
         cancel: CancellationToken,
+        backends: Vec<vc_core::EncoderBackend>,
     ) -> Result<(), RuntimeError> {
-        let (ids, backends) = {
-            let state = self.state.lock().await;
-            let ids = state
-                .items
-                .iter()
-                .filter(|item| item.status == vc_core::queue::QueueItemStatus::Queued)
-                .map(|item| item.item_id.clone())
-                .collect::<Vec<_>>();
-            let mut queued = state
-                .items
-                .iter()
-                .filter(|item| item.status == vc_core::queue::QueueItemStatus::Queued);
-            let backends = queued
-                .next()
-                .map(|item| item.plan.settings.parallel_backends.clone())
-                .unwrap_or_default();
-            if queued.any(|item| {
-                !item.plan.settings.parallel_enabled
-                    || item.plan.settings.parallel_backends != backends
-            }) {
-                return Err(RuntimeError::Planning(
-                    "Queued items use different parallel backend selections.".into(),
-                ));
-            }
-            (ids, backends)
-        };
-        let backends = unique_parallel_backends(&backends)
-            .into_iter()
-            .filter(|backend| *backend != vc_core::EncoderBackend::Auto)
+        let ids = self
+            .state
+            .lock()
+            .await
+            .items
+            .iter()
+            .filter(|item| item.status == vc_core::queue::QueueItemStatus::Queued)
+            .map(|item| item.item_id.clone())
             .collect::<Vec<_>>();
-        if backends.is_empty() {
-            return Err(RuntimeError::Planning(
-                "Parallel mode requires at least one explicit backend.".into(),
-            ));
-        }
         let capabilities = ensure_capabilities(&context.paths, &context.tools, false).await?;
         let pending = Arc::new(Mutex::new(VecDeque::from(ids)));
         let mut workers = Vec::with_capacity(backends.len());
