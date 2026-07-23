@@ -297,11 +297,14 @@ pub async fn execute_item(
             .unwrap_or_else(Instant::now);
         let output =
             match run_streaming(request.clone(), cancel.clone(), move |line: ProcessLine| {
+                let log_tx = log_tx.clone();
+                let mut log_lines = Vec::new();
                 match line.stream {
                     OutputStream::Stderr => {
                         // Diagnostic: file log + activity (not machine progress).
-                        let _ = log_tx.try_send(&line.text);
-                        activity_for_line.emit("process", line.text);
+                        let text = line.text;
+                        activity_for_line.emit("process", text.clone());
+                        log_lines.push(text);
                     }
                     OutputStream::Stdout => {
                         // Machine progress: parse only; do not flood activity or raw log.
@@ -321,14 +324,13 @@ pub async fn execute_item(
                                 || update.is_end
                             {
                                 last_summary = Instant::now();
-                                let summary = format!(
+                                log_lines.push(format!(
                                     "progress pass={}/{} percent={:.1} speed={}",
                                     pass as u32 + 1,
                                     total_passes,
                                     overall.unwrap_or(0.0),
                                     speed.as_deref().unwrap_or("-")
-                                );
-                                let _ = log_tx.try_send(summary);
+                                ));
                             }
                             if let Some(callback) = &sink_for_line {
                                 callback(ProgressEvent {
@@ -349,6 +351,12 @@ pub async fn execute_item(
                             }
                         }
                     }
+                }
+                async move {
+                    for line in log_lines {
+                        log_tx.send(line).await?;
+                    }
+                    Ok(())
                 }
             })
             .await
@@ -453,9 +461,17 @@ pub async fn execute_preview(
     let extract_activity = activity.clone();
     let extract_log = log_writer.sender();
     let extract_output = match run_streaming(extract, cancel.clone(), move |line| {
+        let extract_log = extract_log.clone();
+        let mut log_line = None;
         if line.stream == OutputStream::Stderr {
-            let _ = extract_log.try_send(&line.text);
-            extract_activity.emit("process", line.text);
+            extract_activity.emit("process", line.text.clone());
+            log_line = Some(line.text);
+        }
+        async move {
+            if let Some(line) = log_line {
+                extract_log.send(line).await?;
+            }
+            Ok(())
         }
     })
     .await
@@ -502,35 +518,45 @@ pub async fn execute_preview(
         let sink_for_line = sink.clone();
         let duration = job.window.duration_sec;
         let log_tx = log_writer.sender();
-        let output = match run_streaming(request, cancel.clone(), move |line| match line.stream {
-            OutputStream::Stderr => {
-                let _ = log_tx.try_send(&line.text);
-                activity_for_line.emit("process", line.text);
-            }
-            OutputStream::Stdout => {
-                for update in preview_parser.push(&(line.text + "\n")) {
-                    if let Some(callback) = &sink_for_line {
-                        callback(ProgressEvent {
-                            item_id: None,
-                            stage: "preview".into(),
-                            state: if update.is_end {
-                                "finished_file".into()
-                            } else {
-                                "running".into()
-                            },
-                            percent: progress_percent(&update, Some(duration)),
-                            speed: update.values.get("speed").cloned(),
-                            elapsed_sec: update
-                                .values
-                                .get("out_time_us")
-                                .and_then(|value| value.parse::<f64>().ok())
-                                .map(|value| value / 1_000_000.0),
-                            current_pass: pass as u32 + 1,
-                            total_passes,
-                            message: None,
-                        });
+        let output = match run_streaming(request, cancel.clone(), move |line| {
+            let log_tx = log_tx.clone();
+            let mut log_line = None;
+            match line.stream {
+                OutputStream::Stderr => {
+                    activity_for_line.emit("process", line.text.clone());
+                    log_line = Some(line.text);
+                }
+                OutputStream::Stdout => {
+                    for update in preview_parser.push(&(line.text + "\n")) {
+                        if let Some(callback) = &sink_for_line {
+                            callback(ProgressEvent {
+                                item_id: None,
+                                stage: "preview".into(),
+                                state: if update.is_end {
+                                    "finished_file".into()
+                                } else {
+                                    "running".into()
+                                },
+                                percent: progress_percent(&update, Some(duration)),
+                                speed: update.values.get("speed").cloned(),
+                                elapsed_sec: update
+                                    .values
+                                    .get("out_time_us")
+                                    .and_then(|value| value.parse::<f64>().ok())
+                                    .map(|value| value / 1_000_000.0),
+                                current_pass: pass as u32 + 1,
+                                total_passes,
+                                message: None,
+                            });
+                        }
                     }
                 }
+            }
+            async move {
+                if let Some(line) = log_line {
+                    log_tx.send(line).await?;
+                }
+                Ok(())
             }
         })
         .await

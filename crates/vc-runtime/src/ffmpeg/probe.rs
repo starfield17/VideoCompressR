@@ -1,4 +1,4 @@
-use super::process::{ToolRequest, run_capture};
+use super::process::{ToolRequest, run_capture_exact};
 use crate::error::RuntimeError;
 use std::ffi::OsString;
 use std::path::Path;
@@ -12,15 +12,18 @@ pub async fn ffprobe_json(ffprobe: &Path, input: &Path) -> Result<serde_json::Va
         .collect::<Vec<_>>();
     args.push(input.as_os_str().to_os_string());
     let request = ToolRequest { program: ffprobe.to_path_buf(), args, cwd: None };
-    let (code, stdout, stderr) = run_capture(request, CancellationToken::new()).await?;
-    if code != 0 {
-        return Err(RuntimeError::Probe(if stderr.trim().is_empty() {
-            format!("ffprobe exited with {code}")
+    let output = run_capture_exact(request, CancellationToken::new()).await?;
+    if output.cancelled {
+        return Err(RuntimeError::Cancelled);
+    }
+    if output.code != 0 {
+        return Err(RuntimeError::Probe(if output.stderr.trim().is_empty() {
+            format!("ffprobe exited with {}", output.code)
         } else {
-            stderr
+            output.stderr.clone()
         }));
     }
-    serde_json::from_str(&stdout)
+    serde_json::from_str(&output.stdout)
         .map_err(|error| RuntimeError::Probe(format!("ffprobe did not return valid JSON: {error}")))
 }
 

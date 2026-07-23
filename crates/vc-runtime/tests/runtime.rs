@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -16,7 +16,10 @@ use vc_runtime::execution::{
 };
 use vc_runtime::ffmpeg::ToolPaths;
 use vc_runtime::ffmpeg::command::render_encode_commands;
-use vc_runtime::ffmpeg::process::{OutputStream, ToolRequest, run_capture, run_streaming};
+use vc_runtime::ffmpeg::probe::ffprobe_json;
+use vc_runtime::ffmpeg::process::{
+    OutputStream, ToolRequest, run_capture, run_capture_exact, run_streaming,
+};
 use vc_runtime::ffmpeg::progress::{ProgressParser, progress_percent};
 use vc_runtime::planning::{EncodePlan, PlanRequest, PlanningService};
 use vc_runtime::queue::supervisor::{ExecutionContext, QueueSupervisor};
@@ -143,7 +146,8 @@ async fn fake_executable_covers_capture_and_streaming_pipe_contract() {
         cwd: None,
     };
     let result = run_streaming(request, CancellationToken::new(), move |line| {
-        sink.lock().expect("line lock").push((line.stream, line.text))
+        sink.lock().expect("line lock").push((line.stream, line.text));
+        async { Ok(()) }
     })
     .await
     .expect("stream");
@@ -157,11 +161,76 @@ async fn fake_executable_covers_capture_and_streaming_pipe_contract() {
 }
 
 #[tokio::test]
+async fn exact_capture_preserves_more_than_channel_capacity_lines() {
+    let request = ToolRequest { program: fake("fake-large-output"), args: Vec::new(), cwd: None };
+    let output = run_capture_exact(request, CancellationToken::new()).await.expect("exact capture");
+
+    assert_eq!(output.code, 0);
+    assert_eq!(output.stdout.lines().count(), 10_000);
+    assert_eq!(output.stderr.lines().count(), 10_000);
+    assert!(output.stdout.lines().next().is_some_and(|line| line == "stdout-1"));
+    assert!(output.stdout.lines().last().is_some_and(|line| line == "stdout-10000"));
+    assert!(output.stderr.lines().next().is_some_and(|line| line == "stderr-1"));
+    assert!(output.stderr.lines().last().is_some_and(|line| line == "stderr-10000"));
+}
+
+#[tokio::test]
+async fn stderr_lines_are_not_dropped_under_backpressure() {
+    let request = ToolRequest { program: fake("fake-large-output"), args: Vec::new(), cwd: None };
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    run_streaming(request, CancellationToken::new(), move |line| {
+        let sink = sink.clone();
+        async move {
+            tokio::task::yield_now().await;
+            sink.lock().expect("line lock").push((line.stream, line.text));
+            Ok(())
+        }
+    })
+    .await
+    .expect("stream");
+    let captured = lines.lock().expect("line lock");
+    assert_eq!(
+        captured.iter().filter(|(stream, _)| *stream == OutputStream::Stderr).count(),
+        10_000
+    );
+    assert!(
+        captured
+            .iter()
+            .any(|(stream, text)| { *stream == OutputStream::Stderr && text == "stderr-10000" })
+    );
+}
+
+#[tokio::test]
+async fn invalid_utf8_does_not_terminate_process_reader() {
+    let request = ToolRequest { program: fake("fake-invalid-utf8"), args: Vec::new(), cwd: None };
+    let output =
+        run_capture_exact(request, CancellationToken::new()).await.expect("capture invalid utf8");
+
+    assert_eq!(output.stdout.lines().count(), 2);
+    assert_eq!(output.stderr.lines().count(), 2);
+    assert!(output.stdout.contains("stdout-after"));
+    assert!(output.stderr.contains("stderr-after"));
+}
+
+#[tokio::test]
+async fn large_ffprobe_json_is_not_truncated() {
+    let value = ffprobe_json(&fake("fake-large-ffprobe"), Path::new("fixture.mp4"))
+        .await
+        .expect("large ffprobe json");
+    assert_eq!(value["format"]["metadata"]["key-1"], "value-1");
+    assert_eq!(value["format"]["metadata"]["key-10000"], "value-10000");
+}
+
+#[tokio::test]
 async fn fake_hang_is_stopped_by_process_tree_cancellation() {
     let token = CancellationToken::new();
     let worker_token = token.clone();
     let request = ToolRequest { program: fake("fake-hang"), args: Vec::new(), cwd: None };
-    let worker = tokio::spawn(async move { run_streaming(request, worker_token, |_| {}).await });
+    let worker =
+        tokio::spawn(
+            async move { run_streaming(request, worker_token, |_| async { Ok(()) }).await },
+        );
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     token.cancel();
     let result = worker.await.expect("cancel worker").expect("process result");
@@ -186,7 +255,8 @@ async fn fake_nonzero_exit_and_stderr_are_preserved() {
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = lines.clone();
     let result = run_streaming(request, CancellationToken::new(), move |line| {
-        sink.lock().expect("line lock").push((line.stream, line.text))
+        sink.lock().expect("line lock").push((line.stream, line.text));
+        async { Ok(()) }
     })
     .await
     .expect("process result");

@@ -46,6 +46,17 @@ pub struct ProcessLogSender {
 }
 
 impl ProcessLogSender {
+    pub async fn send(&self, text: impl Into<String>) -> Result<(), RuntimeError> {
+        let mut text = text.into();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        self.sender
+            .send(LogCommand::Write(text))
+            .await
+            .map_err(|_| RuntimeError::Encode("process log writer closed".into()))
+    }
+
     pub fn try_send(&self, text: impl Into<String>) -> bool {
         let mut text = text.into();
         if !text.ends_with('\n') {

@@ -2,9 +2,9 @@ use crate::error::RuntimeError;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
@@ -83,6 +83,14 @@ pub struct ProcessOutput {
     pub cancelled: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct CapturedOutput {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub cancelled: bool,
+}
+
 fn command_for(request: &ToolRequest) -> Command {
     #[cfg(windows)]
     let mut command = if request.program.extension().and_then(|value| value.to_str()) == Some("ps1")
@@ -117,30 +125,50 @@ pub async fn run_capture(
     request: ToolRequest,
     cancel: CancellationToken,
 ) -> Result<(i32, String, String), RuntimeError> {
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    let output = run_streaming(request, cancel, |line| {
-        let target = match line.stream {
-            OutputStream::Stdout => &mut stdout,
-            OutputStream::Stderr => &mut stderr,
-        };
-        target.push_str(&line.text);
-        target.push('\n');
-    })
-    .await?;
+    let output = run_capture_exact(request, cancel).await?;
     if output.cancelled {
         return Err(RuntimeError::Cancelled);
     }
-    Ok((output.code, stdout, stderr))
+    Ok((output.code, output.stdout, output.stderr))
 }
 
-pub async fn run_streaming<F>(
+pub async fn run_capture_exact(
+    request: ToolRequest,
+    cancel: CancellationToken,
+) -> Result<CapturedOutput, RuntimeError> {
+    let stdout = std::sync::Arc::new(Mutex::new(String::new()));
+    let stderr = std::sync::Arc::new(Mutex::new(String::new()));
+    let stdout_for_line = stdout.clone();
+    let stderr_for_line = stderr.clone();
+    let output = run_streaming(request, cancel, move |line| {
+        let target = match line.stream {
+            OutputStream::Stdout => stdout_for_line.clone(),
+            OutputStream::Stderr => stderr_for_line.clone(),
+        };
+        async move {
+            let mut target = target.lock().await;
+            target.push_str(&line.text);
+            target.push('\n');
+            Ok(())
+        }
+    })
+    .await?;
+    Ok(CapturedOutput {
+        code: output.code,
+        stdout: stdout.lock().await.clone(),
+        stderr: stderr.lock().await.clone(),
+        cancelled: output.cancelled,
+    })
+}
+
+pub async fn run_streaming<F, Fut>(
     request: ToolRequest,
     cancel: CancellationToken,
     mut on_line: F,
 ) -> Result<ProcessOutput, RuntimeError>
 where
-    F: FnMut(ProcessLine) + Send,
+    F: FnMut(ProcessLine) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<(), RuntimeError>> + Send,
 {
     let mut child = command_for(&request).spawn()?;
     #[cfg(windows)]
@@ -154,37 +182,28 @@ where
         .stderr
         .take()
         .ok_or_else(|| RuntimeError::Encode("FFmpeg stderr pipe was unavailable".into()))?;
-    // Bounded channel: stdout (machine progress) may drop under backpressure;
-    // stderr diagnostics await capacity so they are not silently lost.
+    // Both streams await bounded-channel capacity. Coalescing belongs at the progress sink,
+    // not at the process reader, because capture and diagnostics must remain lossless.
     let (tx, mut rx) = mpsc::channel::<ProcessLine>(1_024);
     let stdout_tx = tx.clone();
-    let stdout_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = stdout_tx.try_send(ProcessLine { stream: OutputStream::Stdout, text: line });
-        }
-    });
+    let stdout_task = tokio::spawn(read_stream(stdout, OutputStream::Stdout, stdout_tx));
     let stderr_tx = tx.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if stderr_tx
-                .send(ProcessLine { stream: OutputStream::Stderr, text: line })
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
+    let stderr_task = tokio::spawn(read_stream(stderr, OutputStream::Stderr, stderr_tx));
     drop(tx);
 
+    let internal_cancel = CancellationToken::new();
     let child_cancel = cancel.clone();
+    let internal_child_cancel = internal_cancel.clone();
     let mut wait_task = Box::pin(tokio::spawn(async move {
         let mut child = child;
         tokio::select! {
             result = child.wait() => Ok::<(std::process::ExitStatus, bool), std::io::Error>((result?, false)),
-            _ = child_cancel.cancelled() => {
+            _ = async {
+                tokio::select! {
+                    _ = child_cancel.cancelled() => {},
+                    _ = internal_child_cancel.cancelled() => {},
+                }
+            } => {
                 if let Some(mut stdin) = stdin { let _ = stdin.write_all(b"q\n").await; let _ = stdin.flush().await; }
                 sleep(Duration::from_millis(350)).await;
                 if child.try_wait()?.is_none() {
@@ -205,20 +224,109 @@ where
         }
     }));
 
-    let mut completion: Option<(std::process::ExitStatus, bool)> = None;
-    loop {
-        if let Some((status, cancelled)) = completion.take() {
-            while let Some(line) = rx.recv().await {
-                on_line(line);
-            }
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            let code = status.code().unwrap_or(-1);
-            return Ok(ProcessOutput { code, cancelled });
+    let mut handler_error = None;
+    let process_result: Result<(std::process::ExitStatus, bool), RuntimeError> = loop {
+        if handler_error.is_some() {
+            break wait_task
+                .await
+                .map_err(|error| RuntimeError::Encode(error.to_string()))?
+                .map_err(RuntimeError::from);
         }
         tokio::select! {
-            line = rx.recv() => match line { Some(value) => on_line(value), None => { completion = Some(wait_task.as_mut().await.map_err(|error| RuntimeError::Encode(error.to_string()))??); } },
-            result = &mut wait_task => { completion = Some(result.map_err(|error| RuntimeError::Encode(error.to_string()))??); },
+            line = rx.recv() => match line {
+                Some(value) => {
+                    if let Err(error) = on_line(value).await {
+                        handler_error = Some(error);
+                        internal_cancel.cancel();
+                    }
+                }
+                None => {
+                    break wait_task
+                        .await
+                        .map_err(|error| RuntimeError::Encode(error.to_string()))?
+                        .map_err(RuntimeError::from);
+                }
+            },
+            result = &mut wait_task => {
+                break result
+                    .map_err(|error| RuntimeError::Encode(error.to_string()))?
+                    .map_err(RuntimeError::from);
+            },
         }
+    };
+
+    while let Some(line) = rx.recv().await {
+        if handler_error.is_none() {
+            if let Err(error) = on_line(line).await {
+                handler_error = Some(error);
+                internal_cancel.cancel();
+            }
+        }
+    }
+    let stdout_result =
+        stdout_task.await.map_err(|error| RuntimeError::Encode(error.to_string()))?;
+    let stderr_result =
+        stderr_task.await.map_err(|error| RuntimeError::Encode(error.to_string()))?;
+    if let Some(error) = handler_error {
+        return Err(error);
+    }
+    stdout_result?;
+    stderr_result?;
+    let (status, cancelled) = process_result?;
+    Ok(ProcessOutput { code: status.code().unwrap_or(-1), cancelled })
+}
+
+async fn read_stream<R>(
+    reader: R,
+    stream: OutputStream,
+    sender: mpsc::Sender<ProcessLine>,
+) -> Result<(), RuntimeError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        let count = reader.read_until(b'\n', &mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+            buffer.pop();
+        }
+        let text = String::from_utf8_lossy(&buffer).into_owned();
+        sender
+            .send(ProcessLine { stream, text })
+            .await
+            .map_err(|_| RuntimeError::Encode("process output consumer closed".into()))?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    struct ErrorReader;
+
+    impl AsyncRead for ErrorReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("fake reader failure")))
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_error_is_propagated() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let error = read_stream(ErrorReader, OutputStream::Stdout, sender)
+            .await
+            .expect_err("reader error must be visible");
+        assert!(error.to_string().contains("fake reader failure"));
     }
 }

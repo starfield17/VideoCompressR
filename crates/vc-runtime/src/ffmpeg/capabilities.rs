@@ -1,5 +1,5 @@
 use super::discovery::ToolPaths;
-use super::process::{ToolRequest, run_capture};
+use super::process::{ToolRequest, run_capture_exact};
 use crate::error::RuntimeError;
 use crate::platform::paths::AppPaths;
 use crate::storage::capability_cache::{CAPABILITY_SCHEMA_VERSION, CapabilityCache};
@@ -38,7 +38,11 @@ async fn run(ffmpeg: &Path, args: &[&str]) -> Result<(i32, String, String), Runt
         args: args.iter().map(OsString::from).collect(),
         cwd: None,
     };
-    run_capture(request, CancellationToken::new()).await
+    let output = run_capture_exact(request, CancellationToken::new()).await?;
+    if output.cancelled {
+        return Err(RuntimeError::Cancelled);
+    }
+    Ok((output.code, output.stdout, output.stderr))
 }
 
 async fn version(ffmpeg: &Path) -> Result<String, RuntimeError> {
