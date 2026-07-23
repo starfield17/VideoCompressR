@@ -78,6 +78,9 @@ jobs:
           echo "VIDEO_COMPRESSOR_DATA_DIR=$e2e_data_dir" >> "$GITHUB_ENV"
           echo "E2E_SOURCE_PATH=$e2e_data_dir/e2e-input.mp4" >> "$GITHUB_ENV"
       - name: Run WebdriverIO Tauri smoke test
+        env:
+          GDK_BACKEND: x11
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: xvfb-run --auto-servernum pnpm --dir apps/desktop e2e
 
   browser:
