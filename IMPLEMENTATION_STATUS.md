@@ -7,15 +7,15 @@ results.
 | Dimension | Current state | Evidence / remaining verification |
 | --- | --- | --- |
 | Reference and architecture boundaries | Implemented | `FEATURE_PARITY.md`, `ARCHITECTURE.md`, `UX_CONTRACT.md`; `reffer/` remains read-only reference material |
-| `vc-core` queue reducer | Implemented | Monotonic item sequences, run-bound transitions, execution-profile validation, and queue invariants are covered by `cargo test --locked -p vc-core` |
-| `vc-runtime` planning and execution | Implemented | Directory probe isolation, cancellation, worker failure cleanup, and mixed-profile rejection are covered by `cargo test --locked -p vc-runtime --test runtime` |
-| React/Tauri UI | Implemented | Plan/Add-to-Queue persistence, error handling, queue controls, Preview, Presets, Settings, and i18n interaction tests in `apps/desktop/src/App.test.tsx` |
-| Hosted CI and parity gates | Baseline green; new reliability pass pending | Baseline: [CI run 29978555373](https://github.com/starfield17/VideoCompressR/actions/runs/29978555373), [parity run 29978555334](https://github.com/starfield17/VideoCompressR/actions/runs/29978555334); the next `main` push must verify the updated workflows |
-| Packaged Tauri and browser E2E | Implemented; hosted verification pending | WebDriver flow uses fake tools and an isolated data directory; browser Playwright covers startup and source validation |
-| Cross-platform release | Implemented; hosted dry-run pending | Six-target matrix, manual `publish` boolean defaulting to false, concurrency, checksums, decompression, SBOM, licenses, build info, and unsigned-status checks are in `.github/workflows/release.yml` |
+| `vc-core` queue reducer | Implemented and locally verified | Monotonic item sequences, run-bound transitions, execution-profile validation, and queue invariants are covered by `cargo test --locked -p vc-core` (15 passed) |
+| `vc-runtime` planning and execution | Implemented and locally verified | Directory probe isolation, cancellation, worker failure cleanup, and mixed-profile rejection are covered by `cargo test --locked -p vc-runtime` (28 passed) |
+| React/Tauri UI | Implemented and locally verified | Plan/Add-to-Queue persistence, error handling, queue controls, Preview, Presets, Settings, and i18n interaction tests pass in `pnpm test:run` (18 passed) |
+| Hosted CI and parity gates | Verified on implementation commit `7db9bb0` | [CI run 29987707554](https://github.com/starfield17/VideoCompressR/actions/runs/29987707554) and [parity run 29987707553](https://github.com/starfield17/VideoCompressR/actions/runs/29987707553) completed successfully on `main` |
+| Packaged Tauri and browser E2E | Verified on implementation commit `7db9bb0` | [Desktop E2E run 29987707590](https://github.com/starfield17/VideoCompressR/actions/runs/29987707590) passed browser Playwright and packaged Tauri WebDriver smoke flows |
+| Cross-platform release | Verified by hosted no-publish dry-run on `7db9bb0` | [Release run 29988026551](https://github.com/starfield17/VideoCompressR/actions/runs/29988026551) passed all 12 CLI/Desktop target jobs; `publish=false` skipped publication as intended |
 
 Known limitations: real GPU encoder behavior remains platform-dependent; the
-release artifacts are intentionally thin and unsigned; Windows/macOS and ARM
-claims require their corresponding hosted runners. Completion requires the
-full local command matrix plus successful hosted CI, E2E, and a manual
-no-publish release run.
+release artifacts are intentionally thin and unsigned; code signing and
+notarization are not part of the no-publish dry-run. The implementation
+evidence above covers the full local command matrix plus successful hosted CI,
+E2E, and a manual no-publish release run; no formal release was published.
