@@ -946,4 +946,6 @@ async fn old_run_cleanup_does_not_clear_new_run_cancel_token() {
     assert_eq!(second.metrics.cancelled_items, 1);
     assert!(second.state.items.iter().all(|item| item.status != QueueItemStatus::Running));
     validate_queue_state(&second.state).expect("valid state after consecutive runs");
+    assert_eq!(supervisor.progress_worker_spawns(), 1);
+    assert_eq!(supervisor.snapshot_worker_spawns(), 1);
 }

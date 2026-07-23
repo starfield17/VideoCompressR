@@ -80,8 +80,15 @@ impl ProcessLogWriter {
         path: PathBuf,
         counter: Option<LogOpenCounter>,
     ) -> Result<Self, RuntimeError> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await?;
+        if let Some(counter) = &counter {
+            counter.record_open();
+        }
         let (sender, receiver) = mpsc::channel(PROCESS_LOG_CHANNEL_CAPACITY);
-        let handle = tokio::spawn(async move { writer_loop(path, receiver, counter).await });
+        let handle = tokio::spawn(async move { writer_loop(file, receiver).await });
         Ok(Self { sender, handle })
     }
 
@@ -125,17 +132,9 @@ impl ProcessLogWriter {
 }
 
 async fn writer_loop(
-    path: PathBuf,
+    file: tokio::fs::File,
     mut receiver: mpsc::Receiver<LogCommand>,
-    counter: Option<LogOpenCounter>,
 ) -> Result<(), RuntimeError> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let file = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await?;
-    if let Some(counter) = &counter {
-        counter.record_open();
-    }
     let mut writer = BufWriter::new(file);
     while let Some(command) = receiver.recv().await {
         match command {
@@ -183,6 +182,23 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("line 0"));
         assert!(text.contains("line 99"));
+    }
+
+    #[tokio::test]
+    async fn open_fails_immediately_when_parent_is_not_a_directory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let parent = temp.path().join("blocked");
+        std::fs::write(&parent, b"file").expect("parent file");
+        let result = ProcessLogWriter::open(parent.join("encode.log")).await;
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_failure_is_returned_by_finish() {
+        let writer = ProcessLogWriter::open(PathBuf::from("/dev/full")).await.expect("open");
+        writer.write_line("this write must fail").await.expect("enqueue");
+        assert!(writer.finish().await.is_err());
     }
 
     #[tokio::test]

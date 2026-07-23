@@ -309,49 +309,18 @@ impl QueueSupervisor {
         }
     }
 
-    /// Force-abort the active run: cancel tokens, mark items, return to Idle.
+    /// Force-abort the active run through the core reducer, even if its task handle is gone.
     pub async fn force_abort_active_run(
         &self,
         reason: impl Into<String>,
     ) -> Result<(), RuntimeError> {
         let reason = reason.into();
         let _control = self.inner.run_control.lock().await;
-        let active = self.inner.active_run.lock().await.clone();
-        if let Some(active) = active {
+        if let Some(active) = self.inner.active_run.lock().await.clone() {
             active.cancel.cancel();
-            match self
-                .apply(QueueCommand::AbortRun {
-                    run_id: active.run_id.clone(),
-                    reason: reason.clone(),
-                })
-                .await
-            {
-                Ok(()) | Err(RuntimeError::Queue(QueueError::StaleRun)) => {}
-                Err(error) => return Err(error),
-            }
-            *self.inner.active_run.lock().await = None;
         }
-        let state = self.inner.state.lock().await;
-        let stuck = state.run_state != QueueRunState::Idle;
-        let run_id = state.active_run_id.clone();
-        drop(state);
-        if stuck {
-            if let Some(run_id) = run_id {
-                let _ = self.apply(QueueCommand::AbortRun { run_id, reason }).await;
-            } else {
-                let mut state = self.inner.state.lock().await;
-                state.run_state = QueueRunState::Idle;
-                state.active_run_id = None;
-                for item in &mut state.items {
-                    if item.status == vc_core::queue::QueueItemStatus::Running {
-                        item.status = vc_core::queue::QueueItemStatus::Cancelled;
-                        item.error = Some(vc_core::queue::JobError { message: reason.clone() });
-                    }
-                }
-                drop(state);
-                self.publish_snapshot_from_state().await;
-            }
-        }
+        self.apply(QueueCommand::RecoverRun { reason }).await?;
+        *self.inner.active_run.lock().await = None;
         Ok(())
     }
 
@@ -1118,7 +1087,27 @@ mod tests {
         *supervisor.inner.active_run.lock().await =
             Some(ActiveRun { run_id: "r".into(), cancel: CancellationToken::new() });
         supervisor.force_abort_active_run("close timeout").await.unwrap();
-        assert_eq!(supervisor.snapshot_now().state.run_state, QueueRunState::Idle);
+        let snapshot = supervisor.snapshot_now();
+        assert_eq!(snapshot.state.run_state, QueueRunState::Idle);
+        assert_eq!(snapshot.state.items[0].status, QueueItemStatus::Cancelled);
+        assert_eq!(snapshot.state.items[0].run_id, None);
+        vc_core::queue::validate_queue_state(&snapshot.state).expect("valid recovered state");
+    }
+
+    #[tokio::test]
+    async fn force_abort_without_active_handle_returns_valid_idle_state() {
+        let supervisor = QueueSupervisor::new(ActivityHub::new());
+        supervisor.enqueue(vec![plan_item("a"), plan_item("b")]).await.unwrap();
+        let item_id = supervisor.snapshot_now().state.items[0].item_id.clone();
+        supervisor.apply(QueueCommand::StartRun { run_id: "lost".into() }).await.unwrap();
+        supervisor.apply(QueueCommand::StartItem { item_id, run_id: "lost".into() }).await.unwrap();
+        supervisor.force_abort_active_run("missing run task").await.unwrap();
+        let snapshot = supervisor.snapshot_now();
+        vc_core::queue::validate_queue_state(&snapshot.state).expect("valid recovered state");
+        assert_eq!(snapshot.state.run_state, QueueRunState::Idle);
+        assert_eq!(snapshot.state.items[0].status, QueueItemStatus::Cancelled);
+        assert_eq!(snapshot.state.items[1].status, QueueItemStatus::Queued);
+        assert!(snapshot.state.items.iter().all(|item| item.run_id.is_none()));
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ pub enum QueueCommand {
     PauseComplete { run_id: String },
     CancelRun { run_id: String },
     AbortRun { run_id: String, reason: String },
+    RecoverRun { reason: String },
     RunIdle { run_id: String },
     Retry { item_ids: Vec<String> },
     Remove { item_ids: Vec<String> },
@@ -366,6 +367,17 @@ fn apply_unchecked(state: &mut QueueState, command: QueueCommand) -> Result<(), 
                     item.error = Some(JobError { message: reason.clone() });
                     item.run_id = None;
                 }
+            }
+            state.run_state = QueueRunState::Idle;
+            state.active_run_id = None;
+        }
+        QueueCommand::RecoverRun { reason } => {
+            for item in &mut state.items {
+                if item.status == QueueItemStatus::Running {
+                    item.status = QueueItemStatus::Cancelled;
+                    item.error = Some(JobError { message: reason.clone() });
+                }
+                item.run_id = None;
             }
             state.run_state = QueueRunState::Idle;
             state.active_run_id = None;

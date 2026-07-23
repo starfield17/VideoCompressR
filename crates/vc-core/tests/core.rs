@@ -269,6 +269,40 @@ fn run_level_events_reject_stale_runs_and_clear_the_active_run() {
 }
 
 #[test]
+fn recover_run_leaves_valid_idle_state_without_stale_run_ids() {
+    let mut state = QueueState::default();
+    apply(
+        &mut state,
+        QueueCommand::Enqueue(vec![
+            planned("running.mp4", "running-out.mp4"),
+            planned("queued.mp4", "queued-out.mp4"),
+        ]),
+    )
+    .expect("enqueue");
+    apply(&mut state, QueueCommand::StartRun { run_id: "run-1".into() }).expect("start");
+    let running_id = state.items[0].item_id.clone();
+    apply(
+        &mut state,
+        QueueCommand::StartItem { item_id: running_id.clone(), run_id: "run-1".into() },
+    )
+    .expect("start item");
+
+    apply(&mut state, QueueCommand::RecoverRun { reason: "worker lost".into() }).expect("recover");
+    validate_queue_state(&state).expect("recovered state is valid");
+    assert_eq!(state.run_state, QueueRunState::Idle);
+    assert_eq!(state.active_run_id, None);
+    assert_eq!(state.items[0].status, QueueItemStatus::Cancelled);
+    assert_eq!(state.items[0].run_id, None);
+    assert_eq!(state.items[1].status, QueueItemStatus::Queued);
+
+    apply(&mut state, QueueCommand::RecoverRun { reason: "repeat".into() })
+        .expect("second recover");
+    validate_queue_state(&state).expect("second recovery is idempotent");
+    assert_eq!(state.items[1].status, QueueItemStatus::Queued);
+    assert_eq!(state.items[1].run_id, None);
+}
+
+#[test]
 fn queue_reducer_rejects_stale_progress_and_computes_metrics() {
     let source = PathBuf::from("input.mp4");
     let settings = EncodeSettings { overwrite: true, ..EncodeSettings::default() };

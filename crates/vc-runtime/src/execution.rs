@@ -49,6 +49,15 @@ pub struct ExecutionResult {
     pub external_subtitle_warnings: Vec<String>,
 }
 
+fn merge_log_failure(primary: RuntimeError, log_result: Result<(), RuntimeError>) -> RuntimeError {
+    match log_result {
+        Ok(()) => primary,
+        Err(log_error) => RuntimeError::Encode(format!(
+            "{primary}; diagnostic log finalization failed: {log_error}"
+        )),
+    }
+}
+
 fn failed_execution_result(
     item: &EncodePlanItem,
     paths: &AppPaths,
@@ -247,11 +256,15 @@ pub async fn execute_item(
 ) -> Result<ExecutionResult, RuntimeError> {
     let log_path = paths.logs_dir.join(format!("{}-encode.log", token(&item.source_path)));
     let log_writer = ProcessLogWriter::open(log_path.clone()).await?;
-    log_writer
+    if let Err(error) = log_writer
         .write_line(format!("[{} / {}] encoding {}", index, total, item.source_path.display()))
-        .await?;
+        .await
+    {
+        let log_result = log_writer.finish().await;
+        return Err(merge_log_failure(error, log_result));
+    }
     if let Some(reason) = &item.skip_reason {
-        let _ = log_writer.finish().await;
+        log_writer.finish().await?;
         return Ok(ExecutionResult {
             item_result: ItemResult {
                 success: false,
@@ -268,7 +281,13 @@ pub async fn execute_item(
             external_subtitle_warnings: Vec::new(),
         });
     }
-    let requests = render_encode_commands(ffmpeg, item, paths, None, None, "encode")?;
+    let requests = match render_encode_commands(ffmpeg, item, paths, None, None, "encode") {
+        Ok(value) => value,
+        Err(error) => {
+            let log_result = log_writer.finish().await;
+            return Err(merge_log_failure(error, log_result));
+        }
+    };
     let passlog = passlog_path(paths, item, "encode");
     let output_existed_before = item.output_path.exists();
     let commands = requests
@@ -281,9 +300,18 @@ pub async fn execute_item(
         })
         .collect::<Vec<_>>();
     if let Some(parent) = item.output_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            let log_result = log_writer.finish().await;
+            return Err(merge_log_failure(error.into(), log_result));
+        }
     }
-    let output_backup = prepare_output_backup(paths, item)?;
+    let output_backup = match prepare_output_backup(paths, item) {
+        Ok(value) => value,
+        Err(error) => {
+            let log_result = log_writer.finish().await;
+            return Err(merge_log_failure(error, log_result));
+        }
+    };
     let total_passes = requests.len() as u32;
     for (pass, request) in requests.iter().enumerate() {
         let mut parser = ProgressParser::default();
@@ -363,29 +391,33 @@ pub async fn execute_item(
             {
                 Ok(value) => value,
                 Err(error) => {
-                    let _ = log_writer.finish().await;
+                    let log_result = log_writer.finish().await;
                     cleanup_passlog(&passlog);
                     restore_output(
                         &item.output_path,
                         output_backup.as_deref(),
                         output_existed_before,
                     );
-                    return Err(error);
+                    return Err(merge_log_failure(error, log_result));
                 }
             };
         if output.cancelled {
-            let _ = log_writer.finish().await;
+            let log_result = log_writer.finish().await;
             cleanup_passlog(&passlog);
             restore_output(&item.output_path, output_backup.as_deref(), output_existed_before);
-            return Err(RuntimeError::Cancelled);
+            return Err(merge_log_failure(RuntimeError::Cancelled, log_result));
         }
         if output.code != 0 {
             let message = format!("FFmpeg exited with code {}", output.code);
-            let _ = log_writer.write_line(&message).await;
-            let _ = log_writer.finish().await;
+            let write_result = log_writer.write_line(&message).await;
+            let finish_result = log_writer.finish().await;
+            let diagnostic_error = write_result.err().or_else(|| finish_result.err());
+            let error_message = diagnostic_error
+                .map(|error| format!("{message}; diagnostic log failed: {error}"))
+                .unwrap_or_else(|| message.clone());
             cleanup_passlog(&passlog);
             restore_output(&item.output_path, output_backup.as_deref(), output_existed_before);
-            activity.emit("error", &message);
+            activity.emit("error", &error_message);
             return Ok(ExecutionResult {
                 item_result: ItemResult {
                     success: false,
@@ -393,7 +425,7 @@ pub async fn execute_item(
                     return_code: Some(output.code),
                     output_path: Some(item.output_path.clone()),
                     log_path: Some(log_path.clone()),
-                    error: Some(message),
+                    error: Some(error_message),
                 },
                 source_path: item.source_path.clone(),
                 output_path: item.output_path.clone(),
@@ -403,8 +435,16 @@ pub async fn execute_item(
             });
         }
     }
-    let _ = log_writer.write_line("encode completed").await;
-    let _ = log_writer.finish().await;
+    if let Err(error) = log_writer.write_line("encode completed").await {
+        cleanup_passlog(&passlog);
+        restore_output(&item.output_path, output_backup.as_deref(), output_existed_before);
+        return Err(error);
+    }
+    if let Err(error) = log_writer.finish().await {
+        cleanup_passlog(&passlog);
+        restore_output(&item.output_path, output_backup.as_deref(), output_existed_before);
+        return Err(error);
+    }
     cleanup_passlog(&passlog);
     if !item.output_path.is_file() {
         restore_output(&item.output_path, output_backup.as_deref(), output_existed_before);
@@ -456,7 +496,10 @@ pub async fn execute_preview(
 ) -> Result<vc_core::PreviewResult, RuntimeError> {
     let log_path = paths.logs_dir.join(format!("{}-preview.log", token(&job.source_path)));
     let log_writer = ProcessLogWriter::open(log_path.clone()).await?;
-    log_writer.write_line("preview start").await?;
+    if let Err(error) = log_writer.write_line("preview start").await {
+        let log_result = log_writer.finish().await;
+        return Err(merge_log_failure(error, log_result));
+    }
     let extract = render_preview_extract(ffmpeg, job);
     let extract_activity = activity.clone();
     let extract_log = log_writer.sender();
@@ -478,23 +521,26 @@ pub async fn execute_preview(
     {
         Ok(value) => value,
         Err(error) => {
-            let _ = log_writer.finish().await;
+            let log_result = log_writer.finish().await;
             cleanup_preview_files(job, paths);
-            return Err(error);
+            return Err(merge_log_failure(error, log_result));
         }
     };
     if extract_output.cancelled {
-        let _ = log_writer.finish().await;
+        let log_result = log_writer.finish().await;
         cleanup_preview_files(job, paths);
-        return Err(RuntimeError::Cancelled);
+        return Err(merge_log_failure(RuntimeError::Cancelled, log_result));
     }
     if extract_output.code != 0 {
-        let _ = log_writer.finish().await;
+        let log_result = log_writer.finish().await;
         cleanup_preview_files(job, paths);
-        return Err(RuntimeError::Encode(format!(
-            "Preview sample extraction failed with code {}",
-            extract_output.code
-        )));
+        return Err(merge_log_failure(
+            RuntimeError::Encode(format!(
+                "Preview sample extraction failed with code {}",
+                extract_output.code
+            )),
+            log_result,
+        ));
     }
     let requests = match render_encode_commands(
         ffmpeg,
@@ -506,9 +552,9 @@ pub async fn execute_preview(
     ) {
         Ok(value) => value,
         Err(error) => {
-            let _ = log_writer.finish().await;
+            let log_result = log_writer.finish().await;
             cleanup_preview_files(job, paths);
-            return Err(error);
+            return Err(merge_log_failure(error, log_result));
         }
     };
     let total_passes = requests.len().max(1) as u32;
@@ -563,26 +609,26 @@ pub async fn execute_preview(
         {
             Ok(value) => value,
             Err(error) => {
-                let _ = log_writer.finish().await;
+                let log_result = log_writer.finish().await;
                 cleanup_preview_files(job, paths);
-                return Err(error);
+                return Err(merge_log_failure(error, log_result));
             }
         };
         if output.cancelled {
-            let _ = log_writer.finish().await;
+            let log_result = log_writer.finish().await;
             cleanup_preview_files(job, paths);
-            return Err(RuntimeError::Cancelled);
+            return Err(merge_log_failure(RuntimeError::Cancelled, log_result));
         }
         if output.code != 0 {
-            let _ = log_writer.finish().await;
+            let log_result = log_writer.finish().await;
             cleanup_preview_files(job, paths);
-            return Err(RuntimeError::Encode(format!(
-                "Preview encoding failed with code {}",
-                output.code
-            )));
+            return Err(merge_log_failure(
+                RuntimeError::Encode(format!("Preview encoding failed with code {}", output.code)),
+                log_result,
+            ));
         }
     }
-    let _ = log_writer.finish().await;
+    log_writer.finish().await?;
     cleanup_passlog(&passlog_path(paths, &job.plan_item, "preview"));
     if cancel.is_cancelled() {
         cleanup_preview_files(job, paths);
