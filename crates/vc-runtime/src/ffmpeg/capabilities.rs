@@ -168,7 +168,8 @@ async fn smoke(ffmpeg: &Path, encoder: &str) -> bool {
     if encoder == "hevc_videotoolbox" {
         args.extend(["-allow_sw", "0"]);
     }
-    args.extend(["-f", "null", "-"]);
+    let null_output = if cfg!(windows) { "NUL" } else { "-" };
+    args.extend(["-f", "null", null_output]);
     match timeout(Duration::from_secs(10), run(ffmpeg, &args)).await {
         Ok(Ok((0, _, _))) => true,
         result => {
