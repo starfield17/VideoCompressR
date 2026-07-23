@@ -72,6 +72,7 @@ jobs:
   architecture:
     name: Architecture and dependency policy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -80,6 +81,18 @@ jobs:
       - run: python3 scripts/check_tauri_resources.py
       - run: python3 scripts/test_checksum.py
       - run: cargo deny check
+
+  performance-stress:
+    name: Performance / Stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Stress and responsiveness tests
+        run: cargo test -p vc-runtime --test stress --locked -- --nocapture
+      - name: Confirm stress tests keep the worktree clean
+        run: git diff --exit-code
 
   desktop-check:
     name: Desktop check (${{ matrix.os }})

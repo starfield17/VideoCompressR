@@ -49,6 +49,44 @@ def main() -> int:
         if forbidden in tauri_text:
             fail(f"Tauri adapter contains runtime implementation detail: {forbidden}")
 
+    # UI-thread / responsiveness guards for the desktop adapter.
+    tauri_lib = ROOT / "apps/desktop/src-tauri/src/lib.rs"
+    if tauri_lib.exists():
+        lib_text = read(tauri_lib)
+        # Strip unit-test module so architectural assertions target production code.
+        production = re.split(r"#\[cfg\(test\)\]\s*mod tests", lib_text, maxsplit=1)[0]
+        handler_start = production.find(".on_window_event")
+        if handler_start < 0:
+            fail("desktop adapter missing on_window_event handler")
+        handler_end = production.find(".invoke_handler", handler_start)
+        handler = production[handler_start:handler_end if handler_end > 0 else None]
+        for forbidden in ("block_on(", "block_in_place", "sync_all", "std::fs::"):
+            if forbidden in handler:
+                fail(f"window event handler must not use {forbidden}")
+        if "store.save" in handler or "window_state.save" in handler:
+            fail("window event handler must not save window state on the UI thread")
+        if "snapshot_now" not in handler:
+            fail("window close path must use queue.snapshot_now() (no block_on)")
+        for name in (
+            "save_settings",
+            "save_app_settings",
+            "preset_list",
+            "preset_load",
+            "preset_save",
+            "preset_delete",
+            "activity_history",
+            "activity_export",
+            "open_aux_window",
+        ):
+            if f"async fn {name}" not in production:
+                fail(f"file I/O command must be async: {name}")
+
+    process_text = "\n".join(
+        read(path) for path in rust_sources(ROOT / "crates/vc-runtime/src/ffmpeg")
+    )
+    if "unbounded_channel" in process_text:
+        fail("process output must not use unbounded_channel")
+
     cli_text = read(ROOT / "apps/cli/src/main.rs")
     if "resolve_encoder" in cli_text or "encoder_candidates" in cli_text:
         fail("CLI contains encoder-selection rules")
@@ -75,7 +113,9 @@ def main() -> int:
         + rust_sources(ROOT / "apps/desktop/src-tauri/src")
     )
     for path in production_sources:
-        if re.search(r"\.(unwrap|expect)\s*\(", read(path)):
+        # Unit-test modules inside src/ are allowed to use unwrap/expect.
+        production = re.split(r"#\[cfg\(test\)\]\s*mod\s+\w+", read(path), maxsplit=1)[0]
+        if re.search(r"\.(unwrap|expect)\s*\(", production):
             fail(f"production Rust source uses unwrap/expect: {path}")
 
     root_build_inputs = [ROOT / "Cargo.toml", ROOT / "pnpm-workspace.yaml", ROOT / "package.json"]

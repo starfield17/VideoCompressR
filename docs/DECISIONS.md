@@ -54,3 +54,21 @@ Validation happens before the run identifier is assigned, so a rejected mixed
 queue cannot partially start workers. Parallel scheduling consumes the
 validated profile rather than re-deriving it from whichever item a worker sees
 first.
+
+## D-0009: UI-thread responsiveness (geometry, close, file IPC)
+
+Window geometry is an in-memory cache (`WindowGeometryRuntime`) with 750ms
+debounced `spawn_blocking` persistence. Window event handlers never call
+`store.load`/`store.save`, `std::fs`, `sync_all`, or `block_on`. Close while
+busy uses `snapshot_now()`, `wait_until_idle(15s)`, then `force_abort_active_run`
+so the main window cannot hang forever. File I/O Tauri commands are `async` and
+run filesystem work on `spawn_blocking` via `blocking_api`.
+
+## D-0010: Bounded hot paths for progress, logs, and activity
+
+Progress updates share one long-lived worker and a coalesced snapshot publisher
+(≈200ms). Metrics are computed only when a snapshot is published. Process logs
+open once per execution (`ProcessLogWriter`, bounded channel). Activity history
+is a `VecDeque` capped at 5_000; IPC history defaults to 500 and clamps to
+2_000. Queue/activity IPC subscriptions are cancellable and cleaned up from
+React effects.

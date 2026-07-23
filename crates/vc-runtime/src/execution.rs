@@ -9,17 +9,20 @@ use crate::ffmpeg::command::{
 use crate::ffmpeg::process::{OutputStream, ProcessLine, run_streaming};
 use crate::ffmpeg::progress::{ProgressParser, progress_percent};
 use crate::platform::paths::AppPaths;
+use crate::process_log::ProcessLogWriter;
 use crate::subtitles::copy_external_subtitles;
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use vc_core::planning::{resolve_encoder, unique_parallel_backends};
 use vc_core::queue::ItemResult;
 use vc_core::{EncodePlanItem, EncoderBackend};
+
+/// Minimum interval between progress summary lines written to the process log.
+const PROGRESS_LOG_SUMMARY_INTERVAL_SECS: f64 = 3.0;
 
 #[derive(Clone, Debug)]
 pub struct ProgressEvent {
@@ -243,11 +246,12 @@ pub async fn execute_item(
     item_id: Option<String>,
 ) -> Result<ExecutionResult, RuntimeError> {
     let log_path = paths.logs_dir.join(format!("{}-encode.log", token(&item.source_path)));
-    append_log(
-        &log_path,
-        &format!("[{} / {}] encoding {}\n", index, total, item.source_path.display()),
-    )?;
+    let log_writer = ProcessLogWriter::open(log_path.clone()).await?;
+    log_writer
+        .write_line(format!("[{} / {}] encoding {}", index, total, item.source_path.display()))
+        .await?;
     if let Some(reason) = &item.skip_reason {
+        let _ = log_writer.finish().await;
         return Ok(ExecutionResult {
             item_result: ItemResult {
                 success: false,
@@ -284,16 +288,23 @@ pub async fn execute_item(
     for (pass, request) in requests.iter().enumerate() {
         let mut parser = ProgressParser::default();
         let duration = item.media_info.as_ref().map(|value| value.duration);
-        let log_for_line = log_path.clone();
         let activity_for_line = activity.clone();
         let sink_for_line = sink.clone();
         let item_id_for_line = item_id.clone();
+        let log_tx = log_writer.sender();
+        let mut last_summary = Instant::now()
+            .checked_sub(std::time::Duration::from_secs_f64(PROGRESS_LOG_SUMMARY_INTERVAL_SECS))
+            .unwrap_or_else(Instant::now);
         let output =
             match run_streaming(request.clone(), cancel.clone(), move |line: ProcessLine| {
-                let _ = append_log(&log_for_line, &format!("{}\n", line.text));
                 match line.stream {
-                    OutputStream::Stderr => activity_for_line.emit("process", line.text),
+                    OutputStream::Stderr => {
+                        // Diagnostic: file log + activity (not machine progress).
+                        let _ = log_tx.try_send(&line.text);
+                        activity_for_line.emit("process", line.text);
+                    }
                     OutputStream::Stdout => {
+                        // Machine progress: parse only; do not flood activity or raw log.
                         for update in parser.push(&(line.text + "\n")) {
                             let percent = progress_percent(&update, duration);
                             let speed = update.values.get("speed").cloned();
@@ -302,6 +313,23 @@ pub async fn execute_item(
                                 .get("out_time_us")
                                 .and_then(|value| value.parse::<f64>().ok())
                                 .map(|value| value / 1_000_000.0);
+                            let overall = percent.map(|value| {
+                                ((pass as f64 + value / 100.0) / total_passes as f64) * 100.0
+                            });
+                            if last_summary.elapsed().as_secs_f64()
+                                >= PROGRESS_LOG_SUMMARY_INTERVAL_SECS
+                                || update.is_end
+                            {
+                                last_summary = Instant::now();
+                                let summary = format!(
+                                    "progress pass={}/{} percent={:.1} speed={}",
+                                    pass as u32 + 1,
+                                    total_passes,
+                                    overall.unwrap_or(0.0),
+                                    speed.as_deref().unwrap_or("-")
+                                );
+                                let _ = log_tx.try_send(summary);
+                            }
                             if let Some(callback) = &sink_for_line {
                                 callback(ProgressEvent {
                                     item_id: item_id_for_line.clone(),
@@ -311,10 +339,7 @@ pub async fn execute_item(
                                     } else {
                                         "running".into()
                                     },
-                                    percent: percent.map(|value| {
-                                        ((pass as f64 + value / 100.0) / total_passes as f64)
-                                            * 100.0
-                                    }),
+                                    percent: overall,
                                     speed,
                                     elapsed_sec: elapsed,
                                     current_pass: pass as u32 + 1,
@@ -330,6 +355,7 @@ pub async fn execute_item(
             {
                 Ok(value) => value,
                 Err(error) => {
+                    let _ = log_writer.finish().await;
                     cleanup_passlog(&passlog);
                     restore_output(
                         &item.output_path,
@@ -340,14 +366,17 @@ pub async fn execute_item(
                 }
             };
         if output.cancelled {
+            let _ = log_writer.finish().await;
             cleanup_passlog(&passlog);
             restore_output(&item.output_path, output_backup.as_deref(), output_existed_before);
             return Err(RuntimeError::Cancelled);
         }
         if output.code != 0 {
+            let message = format!("FFmpeg exited with code {}", output.code);
+            let _ = log_writer.write_line(&message).await;
+            let _ = log_writer.finish().await;
             cleanup_passlog(&passlog);
             restore_output(&item.output_path, output_backup.as_deref(), output_existed_before);
-            let message = format!("FFmpeg exited with code {}", output.code);
             activity.emit("error", &message);
             return Ok(ExecutionResult {
                 item_result: ItemResult {
@@ -366,6 +395,8 @@ pub async fn execute_item(
             });
         }
     }
+    let _ = log_writer.write_line("encode completed").await;
+    let _ = log_writer.finish().await;
     cleanup_passlog(&passlog);
     if !item.output_path.is_file() {
         restore_output(&item.output_path, output_backup.as_deref(), output_existed_before);
@@ -416,12 +447,14 @@ pub async fn execute_preview(
     sink: Option<ProgressSink>,
 ) -> Result<vc_core::PreviewResult, RuntimeError> {
     let log_path = paths.logs_dir.join(format!("{}-preview.log", token(&job.source_path)));
+    let log_writer = ProcessLogWriter::open(log_path.clone()).await?;
+    log_writer.write_line("preview start").await?;
     let extract = render_preview_extract(ffmpeg, job);
-    let extract_log = log_path.clone();
     let extract_activity = activity.clone();
+    let extract_log = log_writer.sender();
     let extract_output = match run_streaming(extract, cancel.clone(), move |line| {
-        let _ = append_log(&extract_log, &format!("{}\n", line.text));
         if line.stream == OutputStream::Stderr {
+            let _ = extract_log.try_send(&line.text);
             extract_activity.emit("process", line.text);
         }
     })
@@ -429,15 +462,18 @@ pub async fn execute_preview(
     {
         Ok(value) => value,
         Err(error) => {
+            let _ = log_writer.finish().await;
             cleanup_preview_files(job, paths);
             return Err(error);
         }
     };
     if extract_output.cancelled {
+        let _ = log_writer.finish().await;
         cleanup_preview_files(job, paths);
         return Err(RuntimeError::Cancelled);
     }
     if extract_output.code != 0 {
+        let _ = log_writer.finish().await;
         cleanup_preview_files(job, paths);
         return Err(RuntimeError::Encode(format!(
             "Preview sample extraction failed with code {}",
@@ -454,6 +490,7 @@ pub async fn execute_preview(
     ) {
         Ok(value) => value,
         Err(error) => {
+            let _ = log_writer.finish().await;
             cleanup_preview_files(job, paths);
             return Err(error);
         }
@@ -461,37 +498,37 @@ pub async fn execute_preview(
     let total_passes = requests.len().max(1) as u32;
     for (pass, request) in requests.into_iter().enumerate() {
         let mut preview_parser = ProgressParser::default();
-        let log_for_line = log_path.clone();
         let activity_for_line = activity.clone();
         let sink_for_line = sink.clone();
         let duration = job.window.duration_sec;
-        let output = match run_streaming(request, cancel.clone(), move |line| {
-            let _ = append_log(&log_for_line, &format!("{}\n", line.text));
-            match line.stream {
-                OutputStream::Stderr => activity_for_line.emit("process", line.text),
-                OutputStream::Stdout => {
-                    for update in preview_parser.push(&(line.text + "\n")) {
-                        if let Some(callback) = &sink_for_line {
-                            callback(ProgressEvent {
-                                item_id: None,
-                                stage: "preview".into(),
-                                state: if update.is_end {
-                                    "finished_file".into()
-                                } else {
-                                    "running".into()
-                                },
-                                percent: progress_percent(&update, Some(duration)),
-                                speed: update.values.get("speed").cloned(),
-                                elapsed_sec: update
-                                    .values
-                                    .get("out_time_us")
-                                    .and_then(|value| value.parse::<f64>().ok())
-                                    .map(|value| value / 1_000_000.0),
-                                current_pass: pass as u32 + 1,
-                                total_passes,
-                                message: None,
-                            });
-                        }
+        let log_tx = log_writer.sender();
+        let output = match run_streaming(request, cancel.clone(), move |line| match line.stream {
+            OutputStream::Stderr => {
+                let _ = log_tx.try_send(&line.text);
+                activity_for_line.emit("process", line.text);
+            }
+            OutputStream::Stdout => {
+                for update in preview_parser.push(&(line.text + "\n")) {
+                    if let Some(callback) = &sink_for_line {
+                        callback(ProgressEvent {
+                            item_id: None,
+                            stage: "preview".into(),
+                            state: if update.is_end {
+                                "finished_file".into()
+                            } else {
+                                "running".into()
+                            },
+                            percent: progress_percent(&update, Some(duration)),
+                            speed: update.values.get("speed").cloned(),
+                            elapsed_sec: update
+                                .values
+                                .get("out_time_us")
+                                .and_then(|value| value.parse::<f64>().ok())
+                                .map(|value| value / 1_000_000.0),
+                            current_pass: pass as u32 + 1,
+                            total_passes,
+                            message: None,
+                        });
                     }
                 }
             }
@@ -500,15 +537,18 @@ pub async fn execute_preview(
         {
             Ok(value) => value,
             Err(error) => {
+                let _ = log_writer.finish().await;
                 cleanup_preview_files(job, paths);
                 return Err(error);
             }
         };
         if output.cancelled {
+            let _ = log_writer.finish().await;
             cleanup_preview_files(job, paths);
             return Err(RuntimeError::Cancelled);
         }
         if output.code != 0 {
+            let _ = log_writer.finish().await;
             cleanup_preview_files(job, paths);
             return Err(RuntimeError::Encode(format!(
                 "Preview encoding failed with code {}",
@@ -516,6 +556,7 @@ pub async fn execute_preview(
             )));
         }
     }
+    let _ = log_writer.finish().await;
     cleanup_passlog(&passlog_path(paths, &job.plan_item, "preview"));
     if cancel.is_cancelled() {
         cleanup_preview_files(job, paths);
@@ -550,13 +591,6 @@ pub async fn execute_preview(
         log_path: Some(log_path),
         error_message: None,
     })
-}
-
-fn append_log(path: &Path, text: &str) -> Result<(), RuntimeError> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(text.as_bytes())?;
-    file.flush()?;
-    Ok(())
 }
 
 fn prepare_output_backup(

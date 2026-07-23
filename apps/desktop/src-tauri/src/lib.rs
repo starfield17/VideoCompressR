@@ -6,37 +6,89 @@ use contracts::{
     QueueMetricsDto, QueueProgressDto, QueueSnapshotDto, QueueStateDto, QueueStreamMessage,
     SettingsDto,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::ipc::Channel;
 use tauri::{
     AppHandle, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindowBuilder,
 };
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 use vc_core::queue::{QueueItemStatus, QueueRunState};
 use vc_core::{
     AudioMode, Codec, CompressionRatio, ContainerFormat, DecodeAcceleration, EncodeSettings,
     EncoderBackend, PreviewOptions, PreviewSampleMode,
 };
-use vc_runtime::queue::supervisor::QueueSnapshot;
-use vc_runtime::storage::window_state::{WindowGeometry, WindowStateStore};
-use vc_runtime::{Application, PlanRequest, RuntimeError};
+use vc_runtime::queue::supervisor::{DEFAULT_CLOSE_IDLE_TIMEOUT, QueueSnapshot, WaitForIdleError};
+use vc_runtime::storage::window_state::{
+    GeometryEventKind, WindowGeometry, WindowGeometryRuntime, WindowStateStore,
+    classify_geometry_event,
+};
+use vc_runtime::{Application, DEFAULT_ACTIVITY_HISTORY_LIMIT, PlanRequest, RuntimeError};
+
+/// Registry of cancellable IPC stream subscriptions.
+#[derive(Clone, Default)]
+pub struct SubscriptionRegistry {
+    inner: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl SubscriptionRegistry {
+    pub fn insert(&self, token: CancellationToken) -> String {
+        let id = Uuid::new_v4().to_string();
+        if let Ok(mut map) = self.inner.lock() {
+            map.insert(id.clone(), token);
+        }
+        id
+    }
+
+    pub fn cancel(&self, id: &str) -> bool {
+        let token = self.inner.lock().ok().and_then(|mut map| map.remove(id));
+        if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove(&self, id: &str) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(id);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|map| map.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 #[derive(Clone)]
 pub struct AppRuntime {
     pub application: Application,
-    pub window_state: WindowStateStore,
+    pub geometry: WindowGeometryRuntime,
+    pub subscriptions: SubscriptionRegistry,
 }
 
-fn restore_window_geometry(window: &tauri::WebviewWindow, store: &WindowStateStore) {
-    let Ok(state) = store.load() else {
-        return;
-    };
-    let Some(geometry) = state.windows.get(window.label()) else {
-        return;
-    };
+async fn blocking_api<T, F>(operation: F) -> Result<T, ApiErrorDto>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RuntimeError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| ApiErrorDto { code: "join".into(), message: error.to_string() })?
+        .map_err(api_error)
+}
+
+fn restore_window_geometry_from_cache(window: &tauri::WebviewWindow, geometry: &WindowGeometry) {
     if geometry.width > 0 && geometry.height > 0 {
         let _ = window.set_size(PhysicalSize::new(geometry.width, geometry.height));
     }
@@ -48,26 +100,41 @@ fn restore_window_geometry(window: &tauri::WebviewWindow, store: &WindowStateSto
     }
 }
 
-fn persist_window_geometry(window: &tauri::Window, store: &WindowStateStore) {
-    let Ok(size) = window.inner_size() else {
-        return;
-    };
+fn read_window_geometry(window: &tauri::Window) -> Option<WindowGeometry> {
+    let size = window.inner_size().ok()?;
     let position = window.outer_position().ok();
     let maximized = window.is_maximized().unwrap_or(false);
-    let Ok(mut state) = store.load() else {
+    Some(WindowGeometry {
+        width: size.width,
+        height: size.height,
+        x: position.as_ref().map(|value| value.x),
+        y: position.as_ref().map(|value| value.y),
+        maximized,
+    })
+}
+
+fn note_and_schedule_geometry(runtime: &WindowGeometryRuntime, window: &tauri::Window) {
+    let Some(geometry) = read_window_geometry(window) else {
         return;
     };
-    state.windows.insert(
-        window.label().to_owned(),
-        WindowGeometry {
-            width: size.width,
-            height: size.height,
-            x: position.as_ref().map(|value| value.x),
-            y: position.as_ref().map(|value| value.y),
-            maximized,
-        },
-    );
-    let _ = store.save(state);
+    runtime.note_geometry(window.label(), geometry);
+    let generation = runtime.bump_generation();
+    let runtime = runtime.clone();
+    tauri::async_runtime::spawn(async move {
+        runtime.schedule_save_after(generation, tokio::time::sleep).await;
+    });
+}
+
+fn flush_geometry_async(runtime: WindowGeometryRuntime) {
+    tauri::async_runtime::spawn(async move {
+        let result =
+            tauri::async_runtime::spawn_blocking(move || runtime.flush_pending_now()).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("window geometry flush failed: {error}"),
+            Err(error) => eprintln!("window geometry flush join failed: {error}"),
+        }
+    });
 }
 
 fn app_settings_to_dto(value: &vc_runtime::storage::app_config::AppConfig) -> AppSettingsDto {
@@ -356,7 +423,7 @@ fn queue_snapshot_to_dto(snapshot: &QueueSnapshot) -> QueueSnapshotDto {
 }
 
 #[tauri::command]
-fn open_aux_window(
+async fn open_aux_window(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     kind: String,
@@ -375,6 +442,8 @@ fn open_aux_window(
             .map_err(|error| ApiErrorDto { code: "window".into(), message: error.to_string() })?;
         return Ok(());
     }
+    // Geometry comes from the in-memory cache only — no disk read on the command path.
+    let cached = state.geometry.get(label);
     let window = WebviewWindowBuilder::new(
         &app,
         label,
@@ -387,7 +456,9 @@ fn open_aux_window(
     .center()
     .build()
     .map_err(|error| ApiErrorDto { code: "window".into(), message: error.to_string() })?;
-    restore_window_geometry(&window, &state.window_state);
+    if let Some(geometry) = cached {
+        restore_window_geometry_from_cache(&window, &geometry);
+    }
     Ok(())
 }
 
@@ -473,22 +544,46 @@ async fn queue_clear_completed(state: State<'_, AppRuntime>) -> Result<(), ApiEr
 fn queue_subscribe(
     state: State<'_, AppRuntime>,
     channel: Channel<QueueStreamMessage>,
-) -> Result<(), ApiErrorDto> {
+) -> Result<String, ApiErrorDto> {
     let receiver = state.application.queue.subscribe();
     let initial = receiver.borrow().as_ref().clone();
     channel
         .send(QueueStreamMessage::Snapshot(queue_snapshot_to_dto(&initial)))
         .map_err(|error| ApiErrorDto { code: "ipc".into(), message: error.to_string() })?;
+    let cancel = CancellationToken::new();
+    let subscription_id = state.subscriptions.insert(cancel.clone());
+    let registry = state.subscriptions.clone();
+    let id_for_task = subscription_id.clone();
     tauri::async_runtime::spawn(async move {
         let mut receiver = receiver;
-        while receiver.changed().await.is_ok() {
-            let snapshot = receiver.borrow().as_ref().clone();
-            if channel.send(QueueStreamMessage::Snapshot(queue_snapshot_to_dto(&snapshot))).is_err()
-            {
-                break;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let snapshot = receiver.borrow().as_ref().clone();
+                    if channel
+                        .send(QueueStreamMessage::Snapshot(queue_snapshot_to_dto(&snapshot)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
+        registry.remove(&id_for_task);
     });
+    Ok(subscription_id)
+}
+
+#[tauri::command]
+fn queue_unsubscribe(
+    state: State<'_, AppRuntime>,
+    subscription_id: String,
+) -> Result<(), ApiErrorDto> {
+    state.subscriptions.cancel(&subscription_id);
     Ok(())
 }
 
@@ -496,36 +591,67 @@ fn queue_subscribe(
 fn activity_subscribe(
     state: State<'_, AppRuntime>,
     channel: Channel<QueueStreamMessage>,
-) -> Result<(), ApiErrorDto> {
+) -> Result<String, ApiErrorDto> {
     let mut receiver = state.application.activity.subscribe();
+    let cancel = CancellationToken::new();
+    let subscription_id = state.subscriptions.insert(cancel.clone());
+    let registry = state.subscriptions.clone();
+    let id_for_task = subscription_id.clone();
     tauri::async_runtime::spawn(async move {
-        while let Ok(event) = receiver.recv().await {
-            let message = QueueStreamMessage::Activity(ActivityEventDto {
-                category: event.category,
-                message: event.message,
-                timestamp: event.timestamp,
-            });
-            if channel.send(message).is_err() {
-                break;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                event = receiver.recv() => {
+                    let Ok(event) = event else { break; };
+                    let message = QueueStreamMessage::Activity(ActivityEventDto {
+                        category: event.category,
+                        message: event.message,
+                        timestamp: event.timestamp,
+                    });
+                    if channel.send(message).is_err() {
+                        break;
+                    }
+                }
             }
         }
+        registry.remove(&id_for_task);
     });
+    Ok(subscription_id)
+}
+
+#[tauri::command]
+fn activity_unsubscribe(
+    state: State<'_, AppRuntime>,
+    subscription_id: String,
+) -> Result<(), ApiErrorDto> {
+    state.subscriptions.cancel(&subscription_id);
     Ok(())
 }
 
 #[tauri::command]
-fn activity_history(state: State<'_, AppRuntime>) -> Vec<ActivityEventDto> {
-    state
-        .application
-        .activity
-        .history()
-        .into_iter()
-        .map(|event| ActivityEventDto {
-            category: event.category,
-            message: event.message,
-            timestamp: event.timestamp,
-        })
-        .collect()
+fn subscription_count(state: State<'_, AppRuntime>) -> usize {
+    state.subscriptions.len()
+}
+
+#[tauri::command]
+async fn activity_history(
+    state: State<'_, AppRuntime>,
+    limit: Option<usize>,
+) -> Result<Vec<ActivityEventDto>, ApiErrorDto> {
+    let activity = state.application.activity.clone();
+    let limit = limit.unwrap_or(DEFAULT_ACTIVITY_HISTORY_LIMIT);
+    blocking_api(move || {
+        Ok(activity
+            .history_tail(limit)
+            .into_iter()
+            .map(|event| ActivityEventDto {
+                category: event.category,
+                message: event.message,
+                timestamp: event.timestamp,
+            })
+            .collect())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -534,8 +660,9 @@ fn activity_clear(state: State<'_, AppRuntime>) {
 }
 
 #[tauri::command]
-fn activity_export(state: State<'_, AppRuntime>, path: String) -> Result<(), ApiErrorDto> {
-    state.application.activity.export(&PathBuf::from(path)).map_err(api_error)
+async fn activity_export(state: State<'_, AppRuntime>, path: String) -> Result<(), ApiErrorDto> {
+    let activity = state.application.activity.clone();
+    blocking_api(move || activity.export(&PathBuf::from(path))).await
 }
 
 #[tauri::command]
@@ -544,51 +671,62 @@ async fn redetect_encoders(state: State<'_, AppRuntime>) -> Result<(), ApiErrorD
 }
 
 #[tauri::command]
-fn save_settings(state: State<'_, AppRuntime>, settings: SettingsDto) -> Result<(), ApiErrorDto> {
-    state.application.save_settings(&settings_from_dto(settings)?).map_err(api_error)
+async fn save_settings(
+    state: State<'_, AppRuntime>,
+    settings: SettingsDto,
+) -> Result<(), ApiErrorDto> {
+    let application = state.application.clone();
+    let settings = settings_from_dto(settings)?;
+    blocking_api(move || application.save_settings(&settings)).await
 }
 
 #[tauri::command]
-fn save_app_settings(
+async fn save_app_settings(
     state: State<'_, AppRuntime>,
     settings: AppSettingsDto,
 ) -> Result<(), ApiErrorDto> {
-    let current = state.application.config().map_err(api_error)?;
-    state.application.save_config(&app_settings_from_dto(settings, current)).map_err(api_error)
+    let application = state.application.clone();
+    blocking_api(move || {
+        let current = application.config()?;
+        application.save_config(&app_settings_from_dto(settings, current))
+    })
+    .await
 }
 
 #[tauri::command]
-fn preset_list(state: State<'_, AppRuntime>) -> Result<Vec<String>, ApiErrorDto> {
-    state.application.presets.list().map_err(api_error)
+async fn preset_list(state: State<'_, AppRuntime>) -> Result<Vec<String>, ApiErrorDto> {
+    let application = state.application.clone();
+    blocking_api(move || application.presets.list()).await
 }
 
 #[tauri::command]
-fn preset_load(state: State<'_, AppRuntime>, name: String) -> Result<SettingsDto, ApiErrorDto> {
-    state
-        .application
-        .presets
-        .load(&name)
-        .map(|settings| settings_to_dto(&settings))
-        .map_err(api_error)
+async fn preset_load(
+    state: State<'_, AppRuntime>,
+    name: String,
+) -> Result<SettingsDto, ApiErrorDto> {
+    let application = state.application.clone();
+    blocking_api(move || application.presets.load(&name).map(|settings| settings_to_dto(&settings)))
+        .await
 }
 
 #[tauri::command]
-fn preset_save(
+async fn preset_save(
     state: State<'_, AppRuntime>,
     name: String,
     settings: SettingsDto,
 ) -> Result<String, ApiErrorDto> {
-    state
-        .application
-        .presets
-        .save(&name, &settings_from_dto(settings)?)
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(api_error)
+    let application = state.application.clone();
+    let settings = settings_from_dto(settings)?;
+    blocking_api(move || {
+        application.presets.save(&name, &settings).map(|path| path.to_string_lossy().into_owned())
+    })
+    .await
 }
 
 #[tauri::command]
-fn preset_delete(state: State<'_, AppRuntime>, name: String) -> Result<(), ApiErrorDto> {
-    state.application.presets.delete(&name).map_err(api_error)
+async fn preset_delete(state: State<'_, AppRuntime>, name: String) -> Result<(), ApiErrorDto> {
+    let application = state.application.clone();
+    blocking_api(move || application.presets.delete(&name)).await
 }
 
 #[tauri::command]
@@ -639,34 +777,59 @@ pub fn run() {
         }
     };
     let close_application = application.clone();
-    let window_state = WindowStateStore::new(application.paths.clone());
-    let window_state_for_setup = window_state.clone();
-    let window_state_for_event = window_state.clone();
+    let geometry = WindowGeometryRuntime::load(WindowStateStore::new(application.paths.clone()));
+    let geometry_for_setup = geometry.clone();
+    let geometry_for_event = geometry.clone();
     let close_pending = Arc::new(AtomicBool::new(false));
     let close_pending_for_event = close_pending.clone();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppRuntime { application, window_state })
+        .manage(AppRuntime {
+            application,
+            geometry,
+            subscriptions: SubscriptionRegistry::default(),
+        })
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
-                restore_window_geometry(&window, &window_state_for_setup);
+                if let Some(cached) = geometry_for_setup.get(window.label()) {
+                    restore_window_geometry_from_cache(&window, &cached);
+                }
             }
             Ok(())
         })
         .on_window_event(move |window, event| {
-            persist_window_geometry(window, &window_state_for_event);
+            // Never perform disk I/O or block_on on the UI event thread.
+            let kind = match event {
+                tauri::WindowEvent::Moved(_) => "Moved",
+                tauri::WindowEvent::Resized(_) => "Resized",
+                tauri::WindowEvent::CloseRequested { .. } => "CloseRequested",
+                tauri::WindowEvent::Destroyed => "Destroyed",
+                _ => "Other",
+            };
+            match classify_geometry_event(kind) {
+                GeometryEventKind::MovedOrResized => {
+                    note_and_schedule_geometry(&geometry_for_event, window);
+                }
+                GeometryEventKind::CloseOrDestroyed => {
+                    if let Some(geometry) = read_window_geometry(window) {
+                        geometry_for_event.note_geometry(window.label(), geometry);
+                    }
+                    flush_geometry_async(geometry_for_event.clone());
+                }
+                GeometryEventKind::Irrelevant => {}
+            }
+
             if window.label() != "main" {
                 return;
             }
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
-            let snapshot = tauri::async_runtime::block_on(close_application.queue.snapshot());
+            // Synchronous watch borrow — no block_on.
+            let snapshot = close_application.queue.snapshot_now();
             if matches!(
                 snapshot.state.run_state,
-                vc_core::queue::QueueRunState::Running
-                    | vc_core::queue::QueueRunState::PauseRequested
-                    | vc_core::queue::QueueRunState::Cancelling
+                QueueRunState::Running | QueueRunState::PauseRequested | QueueRunState::Cancelling
             ) {
                 api.prevent_close();
                 if close_pending_for_event.swap(true, Ordering::SeqCst) {
@@ -676,21 +839,34 @@ pub fn run() {
                 let window = window.clone();
                 let close_pending = close_pending_for_event.clone();
                 tauri::async_runtime::spawn(async move {
+                    application.activity.emit(
+                        "queue",
+                        "Close requested while the queue is busy; stopping the active process.",
+                    );
                     let _ = application.queue.stop().await;
-                    loop {
-                        let snapshot = application.queue.snapshot().await;
-                        if snapshot.state.run_state == vc_core::queue::QueueRunState::Idle {
-                            let _ = window.close();
-                            close_pending.store(false, Ordering::SeqCst);
-                            break;
+                    match application.queue.wait_until_idle(DEFAULT_CLOSE_IDLE_TIMEOUT).await {
+                        Ok(()) => {}
+                        Err(WaitForIdleError::TimedOut) => {
+                            eprintln!(
+                                "queue did not become idle within {:?}; force-aborting",
+                                DEFAULT_CLOSE_IDLE_TIMEOUT
+                            );
+                            application.activity.emit(
+                                "error",
+                                "Close timed out waiting for the queue; force-aborting active run.",
+                            );
+                            let _ = application
+                                .queue
+                                .force_abort_active_run("window close timeout")
+                                .await;
+                            // Best-effort short wait after force abort.
+                            let _ = application.queue.wait_until_idle(Duration::from_secs(2)).await;
                         }
-                        sleep(Duration::from_millis(50)).await;
+                        Err(WaitForIdleError::Closed) => {}
                     }
+                    let _ = window.close();
+                    close_pending.store(false, Ordering::SeqCst);
                 });
-                close_application.activity.emit(
-                    "queue",
-                    "Close requested while the queue is busy; stopping the active process.",
-                );
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -706,7 +882,10 @@ pub fn run() {
             queue_remove,
             queue_clear_completed,
             queue_subscribe,
+            queue_unsubscribe,
             activity_subscribe,
+            activity_unsubscribe,
+            subscription_count,
             activity_history,
             activity_clear,
             activity_export,
@@ -721,5 +900,74 @@ pub fn run() {
         ]);
     if let Err(error) = builder.run(tauri::generate_context!()) {
         eprintln!("VideoCompressR desktop exited with an error: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_event_handler_source_has_no_block_on() {
+        let source = include_str!("lib.rs");
+        // Find the on_window_event closure body heuristically.
+        let start = source.find(".on_window_event").expect("on_window_event present");
+        let slice = &source[start..];
+        let end = slice.find(".invoke_handler").unwrap_or(slice.len());
+        let handler = &slice[..end];
+        assert!(!handler.contains("block_on("), "window event handler must not call block_on");
+        assert!(
+            !handler.contains("block_in_place"),
+            "window event handler must not call block_in_place"
+        );
+        assert!(
+            !handler.contains("store.save") && !handler.contains(".save("),
+            "window event handler must not save window state synchronously"
+        );
+        assert!(!handler.contains("sync_all"), "window event handler must not fsync");
+        assert!(handler.contains("snapshot_now"), "close path should use snapshot_now");
+    }
+
+    #[test]
+    fn file_io_commands_are_async() {
+        let source = include_str!("lib.rs");
+        for name in [
+            "save_settings",
+            "save_app_settings",
+            "preset_list",
+            "preset_load",
+            "preset_save",
+            "preset_delete",
+            "activity_history",
+            "activity_export",
+            "open_aux_window",
+        ] {
+            let needle = format!("async fn {name}");
+            assert!(source.contains(&needle), "expected {name} to be an async command");
+        }
+        assert!(
+            source.contains("async fn blocking_api")
+                || source.contains("fn blocking_api")
+                || source.contains("async fn blocking_api")
+                || source.contains("blocking_api")
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_api_propagates_runtime_errors() {
+        let result = blocking_api(|| Err::<(), _>(RuntimeError::Config("boom".into()))).await;
+        let err = result.expect_err("should fail");
+        assert_eq!(err.code, "configuration");
+        assert!(err.message.contains("boom"));
+    }
+
+    #[test]
+    fn unsubscribe_is_idempotent() {
+        let registry = SubscriptionRegistry::default();
+        let token = CancellationToken::new();
+        let id = registry.insert(token);
+        assert!(registry.cancel(&id));
+        assert!(!registry.cancel(&id));
+        assert_eq!(registry.len(), 0);
     }
 }

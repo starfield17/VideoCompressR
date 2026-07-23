@@ -2,10 +2,15 @@ use super::atomic_json::{read_json, recover_corrupt, write_json_atomic};
 use crate::error::RuntimeError;
 use crate::platform::paths::AppPaths;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub const WINDOW_STATE_SCHEMA_VERSION: u32 = 1;
+/// Debounce interval for persisting window geometry after move/resize.
+pub const GEOMETRY_SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct WindowGeometry {
@@ -74,5 +79,264 @@ impl WindowStateStore {
     pub fn save(&self, mut state: WindowState) -> Result<(), RuntimeError> {
         state.schema_version = WINDOW_STATE_SCHEMA_VERSION;
         write_json_atomic(&self.path(), &state)
+    }
+
+    /// Load once, merge all updates, and save once.
+    pub fn merge_geometries(
+        &self,
+        updates: HashMap<String, WindowGeometry>,
+    ) -> Result<(), RuntimeError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.load()?;
+        for (label, geometry) in updates {
+            state.windows.insert(label, geometry);
+        }
+        self.save(state)
+    }
+}
+
+/// In-memory window geometry cache with debounced disk persistence.
+///
+/// Window-event handlers must only touch this type; they must never call
+/// `store.load` / `store.save` or perform filesystem I/O.
+#[derive(Clone)]
+pub struct WindowGeometryRuntime {
+    store: WindowStateStore,
+    cache: Arc<Mutex<HashMap<String, WindowGeometry>>>,
+    pending: Arc<Mutex<HashMap<String, WindowGeometry>>>,
+    generation: Arc<AtomicU64>,
+    save_count: Arc<AtomicU64>,
+}
+
+impl WindowGeometryRuntime {
+    pub fn load(store: WindowStateStore) -> Self {
+        let cache = match store.load() {
+            Ok(state) => state.windows.into_iter().collect(),
+            Err(_) => HashMap::new(),
+        };
+        Self {
+            store,
+            cache: Arc::new(Mutex::new(cache)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
+            save_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn store(&self) -> &WindowStateStore {
+        &self.store
+    }
+
+    pub fn get(&self, label: &str) -> Option<WindowGeometry> {
+        self.cache.lock().ok().and_then(|cache| cache.get(label).cloned())
+    }
+
+    /// Update in-memory geometry only. Returns true if a debounced save should be scheduled.
+    pub fn note_geometry(&self, label: impl Into<String>, geometry: WindowGeometry) -> bool {
+        let label = label.into();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(label.clone(), geometry.clone());
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(label, geometry);
+        }
+        true
+    }
+
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    pub fn take_pending_snapshot(&self) -> HashMap<String, WindowGeometry> {
+        self.pending.lock().map(|mut pending| std::mem::take(&mut *pending)).unwrap_or_default()
+    }
+
+    pub fn save_count(&self) -> u64 {
+        self.save_count.load(Ordering::SeqCst)
+    }
+
+    /// Persist pending geometries immediately (intended for spawn_blocking / tests).
+    pub fn flush_pending_now(&self) -> Result<(), RuntimeError> {
+        let pending = self.take_pending_snapshot();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.store.merge_geometries(pending)?;
+        self.save_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Debounced save: only the latest generation actually writes.
+    ///
+    /// `sleeper` is injectable so tests can avoid real wall-clock waits.
+    pub async fn schedule_save_after<F, Fut>(&self, generation: u64, sleeper: F)
+    where
+        F: FnOnce(Duration) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        sleeper(GEOMETRY_SAVE_DEBOUNCE).await;
+        if self.current_generation() != generation {
+            return;
+        }
+        let runtime = self.clone();
+        let result = tokio::task::spawn_blocking(move || runtime.flush_pending_now()).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "window geometry save failed");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "window geometry save join failed");
+            }
+        }
+    }
+}
+
+/// Classify which window events should update geometry or flush.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeometryEventKind {
+    MovedOrResized,
+    CloseOrDestroyed,
+    Irrelevant,
+}
+
+pub fn classify_geometry_event(kind: &str) -> GeometryEventKind {
+    match kind {
+        "Moved" | "Resized" => GeometryEventKind::MovedOrResized,
+        "CloseRequested" | "Destroyed" => GeometryEventKind::CloseOrDestroyed,
+        _ => GeometryEventKind::Irrelevant,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::paths::AppPaths;
+
+    fn runtime() -> (tempfile::TempDir, WindowGeometryRuntime) {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure().expect("layout");
+        let store = WindowStateStore::new(paths);
+        (temp, WindowGeometryRuntime::load(store))
+    }
+
+    fn geometry(width: u32, height: u32) -> WindowGeometry {
+        WindowGeometry { width, height, x: Some(1), y: Some(2), maximized: false }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn window_geometry_events_are_debounced() {
+        let (_temp, runtime) = runtime();
+        runtime.note_geometry("main", geometry(100, 100));
+        let generation = runtime.bump_generation();
+        let task = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime.schedule_save_after(generation, tokio::time::sleep).await;
+            })
+        };
+        // Before debounce expires: no write yet.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(runtime.save_count(), 0);
+        tokio::time::advance(GEOMETRY_SAVE_DEBOUNCE).await;
+        task.await.expect("task");
+        assert_eq!(runtime.save_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn window_geometry_burst_writes_once() {
+        let (_temp, runtime) = runtime();
+        // Simulate 10_000 events updating memory only, scheduling debounced saves.
+        let mut tasks = Vec::new();
+        for index in 0..10_000 {
+            runtime.note_geometry("main", geometry(100 + (index % 50) as u32, 200));
+            let generation = runtime.bump_generation();
+            let runtime = runtime.clone();
+            tasks.push(tokio::spawn(async move {
+                runtime.schedule_save_after(generation, tokio::time::sleep).await;
+            }));
+        }
+        // Only the final generation should survive the debounce window.
+        tokio::time::advance(GEOMETRY_SAVE_DEBOUNCE + Duration::from_millis(50)).await;
+        for task in tasks {
+            let _ = task.await;
+        }
+        assert!(
+            runtime.save_count() <= 2,
+            "expected at most 2 writes after burst, got {}",
+            runtime.save_count()
+        );
+        assert!(runtime.save_count() >= 1, "expected at least one write after debounce");
+        let loaded = runtime.store.load().expect("load");
+        let main = loaded.windows.get("main").expect("main geometry");
+        // Latest geometry wins (last index 9999 → width 100 + 9999%50 = 149).
+        assert_eq!(main.width, 100 + (9_999 % 50) as u32);
+    }
+
+    #[test]
+    fn latest_geometry_wins() {
+        let (_temp, runtime) = runtime();
+        runtime.note_geometry("main", geometry(100, 100));
+        runtime.note_geometry("main", geometry(900, 600));
+        runtime.flush_pending_now().expect("flush");
+        let loaded = runtime.store.load().expect("load");
+        assert_eq!(loaded.windows.get("main").map(|g| g.width), Some(900));
+    }
+
+    #[test]
+    fn irrelevant_window_events_do_not_schedule_save() {
+        assert_eq!(classify_geometry_event("Focused"), GeometryEventKind::Irrelevant);
+        assert_eq!(classify_geometry_event("ScaleFactorChanged"), GeometryEventKind::Irrelevant);
+        assert_eq!(classify_geometry_event("Moved"), GeometryEventKind::MovedOrResized);
+        assert_eq!(classify_geometry_event("Resized"), GeometryEventKind::MovedOrResized);
+        assert_eq!(classify_geometry_event("CloseRequested"), GeometryEventKind::CloseOrDestroyed);
+        assert_eq!(classify_geometry_event("Destroyed"), GeometryEventKind::CloseOrDestroyed);
+    }
+
+    #[test]
+    fn geometry_save_failure_does_not_block_window_events() {
+        // Point store at a non-writable path by using a file where a directory is expected.
+        let temp = tempfile::tempdir().expect("temp");
+        let file_as_root = temp.path().join("not-a-dir");
+        std::fs::write(&file_as_root, b"x").expect("file");
+        // AppPaths may still construct; force save against a path under a file parent fails.
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure().expect("layout");
+        let store = WindowStateStore::new(paths);
+        // Make path unwritable by replacing config dir with a file after ensure.
+        let config = store.path();
+        if let Some(parent) = config.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+            let _ = std::fs::write(parent, b"blocked");
+        }
+        let runtime = WindowGeometryRuntime::load(store);
+        // note_geometry must return immediately and never panic.
+        assert!(runtime.note_geometry("main", geometry(1, 1)));
+        let err = runtime.flush_pending_now();
+        assert!(err.is_err(), "expected save failure");
+        // Further events still work in memory.
+        assert!(runtime.note_geometry("main", geometry(2, 2)));
+        assert_eq!(runtime.get("main").map(|g| g.width), Some(2));
+    }
+
+    #[test]
+    fn merge_geometries_writes_once() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = AppPaths::from_root(temp.path());
+        paths.ensure().expect("layout");
+        let store = WindowStateStore::new(paths);
+        let mut updates = HashMap::new();
+        updates.insert("main".into(), geometry(800, 600));
+        updates.insert("queue".into(), geometry(400, 300));
+        store.merge_geometries(updates).expect("merge");
+        let loaded = store.load().expect("load");
+        assert_eq!(loaded.windows.len(), 2);
     }
 }

@@ -14,6 +14,13 @@ import type {
 } from "./generated";
 import { queueChannel } from "./channels";
 
+export type SubscriptionHandle = {
+  id: string;
+  unsubscribe(): Promise<void>;
+};
+
+const DEFAULT_ACTIVITY_HISTORY_LIMIT = 500;
+
 export const api = {
   bootstrap: () => invoke<BootstrapDto>("bootstrap"),
   openAuxiliary: (kind: string) => invoke<void>("open_aux_window", { kind }),
@@ -34,23 +41,24 @@ export const api = {
   savePreset: (name: string, settings: SettingsDto) => invoke<string>("preset_save", { name, settings }),
   deletePreset: (name: string) => invoke<void>("preset_delete", { name }),
   preview: (request: PlanRequestDto, options: PreviewOptionsDto) => invoke<PreviewResultDto>("preview", { request, options }),
-  subscribeQueue: (onMessage: (message: QueueStreamMessage) => void) => {
-    try {
-      const channel = queueChannel(onMessage);
-      return invoke<void>("queue_subscribe", { channel });
-    } catch (error) {
-      return Promise.reject(error);
-    }
+  subscribeQueue: async (onMessage: (message: QueueStreamMessage) => void): Promise<SubscriptionHandle> => {
+    const channel = queueChannel(onMessage);
+    const id = await invoke<string>("queue_subscribe", { channel });
+    return {
+      id,
+      unsubscribe: () => invoke<void>("queue_unsubscribe", { subscriptionId: id }),
+    };
   },
-  subscribeActivity: (onMessage: (message: QueueStreamMessage) => void) => {
-    try {
-      const channel = queueChannel(onMessage);
-      return invoke<void>("activity_subscribe", { channel });
-    } catch (error) {
-      return Promise.reject(error);
-    }
+  subscribeActivity: async (onMessage: (message: QueueStreamMessage) => void): Promise<SubscriptionHandle> => {
+    const channel = queueChannel(onMessage);
+    const id = await invoke<string>("activity_subscribe", { channel });
+    return {
+      id,
+      unsubscribe: () => invoke<void>("activity_unsubscribe", { subscriptionId: id }),
+    };
   },
-  activityHistory: () => invoke<ActivityEventDto[]>("activity_history"),
+  activityHistory: (limit = DEFAULT_ACTIVITY_HISTORY_LIMIT) =>
+    invoke<ActivityEventDto[]>("activity_history", { limit }),
   activityClear: () => invoke<void>("activity_clear"),
   exportActivity: async () => {
     const path = await save({
@@ -60,6 +68,7 @@ export const api = {
     if (path) await invoke<void>("activity_export", { path });
   },
   redetectEncoders: () => invoke<void>("redetect_encoders"),
+  subscriptionCount: () => invoke<number>("subscription_count"),
   pickFile: () => open({ multiple: false, directory: false }),
   pickDirectory: () => open({ multiple: false, directory: true }),
 };

@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { api } from "./api/client";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { api, type SubscriptionHandle } from "./api/client";
 import type {
   ActivityEventDto,
   AppSettingsDto,
@@ -14,6 +14,11 @@ import type {
   SettingsDto,
 } from "./api/generated";
 import { translate, type Language } from "./i18n";
+
+/** Max activity rows kept in the React panel (matches backend default history limit). */
+const ACTIVITY_UI_LIMIT = 500;
+/** Initial max queue rows rendered before virtualization windowing. */
+const QUEUE_VISIBLE_CHUNK = 80;
 
 const backendValues: EncoderBackend[] = ["auto", "cpu", "nvenc", "qsv", "amf", "videotoolbox"];
 const parallelBackendValues: Array<[string, string]> = [
@@ -115,9 +120,24 @@ function errorText(error: unknown): string {
 function useRuntimeSnapshot(initial: QueueSnapshotDto | null) {
   const [snapshot, setSnapshot] = useState<QueueSnapshotDto>(initial ?? emptySnapshot);
   useEffect(() => {
-    api.subscribeQueue((message: QueueStreamMessage) => {
-      if (message.type === "snapshot") setSnapshot(message.data);
-    }).catch(() => undefined);
+    let disposed = false;
+    let handle: SubscriptionHandle | undefined;
+    void api
+      .subscribeQueue((message: QueueStreamMessage) => {
+        if (message.type === "snapshot") setSnapshot(message.data);
+      })
+      .then((value) => {
+        if (disposed) {
+          void value.unsubscribe();
+        } else {
+          handle = value;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      void handle?.unsubscribe();
+    };
   }, []);
   return [snapshot, setSnapshot] as const;
 }
@@ -152,8 +172,11 @@ function MainWindow() {
   const t = (key: string, fallback: string) => translate(language, key, fallback);
 
   useEffect(() => {
+    let disposed = false;
+    let handle: SubscriptionHandle | undefined;
     api.bootstrap()
       .then((value) => {
+        if (disposed) return;
         setBootstrap(value);
         setSettings(value.settings);
         setAppSettings(value.appSettings);
@@ -163,11 +186,28 @@ function MainWindow() {
         setSnapshot(value.queue);
         setSelectedPreset(value.appSettings.defaultPresetName ?? "");
       })
-      .catch((error) => setMessage(errorText(error)));
-    api.listPresets().then(setPresetNames).catch(() => undefined);
-    api.subscribeQueue((message: QueueStreamMessage) => {
-      if (message.type === "snapshot") setSnapshot(message.data);
+      .catch((error) => {
+        if (!disposed) setMessage(errorText(error));
+      });
+    api.listPresets().then((names) => {
+      if (!disposed) setPresetNames(names);
     }).catch(() => undefined);
+    void api
+      .subscribeQueue((message: QueueStreamMessage) => {
+        if (message.type === "snapshot") setSnapshot(message.data);
+      })
+      .then((value) => {
+        if (disposed) {
+          void value.unsubscribe();
+        } else {
+          handle = value;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      void handle?.unsubscribe();
+    };
   }, []);
 
   const update = <K extends keyof SettingsDto>(key: K, value: SettingsDto[K]) =>
@@ -490,9 +530,106 @@ function AdvancedOptions({ appSettings, settings, update, updateApp, onSave, onP
 
 function Summary({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
 
-function QueueTable({ items, selected, onSelect, t }: { items: QueueItemDto[]; selected: string[]; onSelect: (id: string, checked: boolean) => void; t: (key: string, fallback: string) => string }) {
-  const headers: [string, string][] = [["gui.table.name", "Name"], ["gui.table.folder", "Folder"], ["gui.table.resolution", "Resolution"], ["gui.table.duration", "Duration"], ["gui.table.source_bitrate", "Source bitrate"], ["gui.table.target_bitrate", "Target bitrate"], ["gui.table.encoder", "Encoder"], ["gui.table.output", "Output"], ["gui.table.tags", "Tags"], ["gui.table.status", "Status"], ["gui.table.progress", "Progress"]];
-  return <div className="table-wrap"><table><thead><tr><th aria-label="select" />{headers.map(([key, fallback]) => <th key={key}>{t(key, fallback)}</th>)}</tr></thead><tbody>{items.map((item) => <tr key={item.itemId}><td><input type="checkbox" checked={selected.includes(item.itemId)} onChange={(event) => onSelect(item.itemId, event.target.checked)} /></td><td>{item.plan.sourcePath.split(/[\\/]/).pop()}</td><td title={item.plan.sourcePath}>{item.plan.sourcePath.split(/[\\/]/).slice(0, -1).join("/") || "-"}</td><td>{item.plan.width && item.plan.height ? `${item.plan.width}x${item.plan.height}` : "n/a"}</td><td>{formatDuration(item.plan.duration)}</td><td>{item.plan.sourceBitrate ? `${Math.round(item.plan.sourceBitrate / 1000)} kbps` : "n/a"}</td><td>{item.plan.targetBitrate ? `${Math.round(item.plan.targetBitrate / 1000)} kbps` : "n/a"}</td><td>{item.plan.encoder ? `${item.plan.encoder} (${item.plan.backend})` : "n/a"}</td><td title={item.plan.outputPath}>{item.plan.outputPath.split(/[\\/]/).pop()}</td><td>{item.plan.warnings.length ? "Warn" : ""}</td><td>{item.status}</td><td>{item.status === "queued" ? "-" : `${item.progress.percent.toFixed(1)}%`}</td></tr>)}</tbody></table>{items.length === 0 && <div className="empty-table">{t("gui.message.queue_empty", "No jobs have been planned yet.")}</div>}</div>;
+const QueueRow = React.memo(function QueueRow({
+  item,
+  checked,
+  onSelect,
+}: {
+  item: QueueItemDto;
+  checked: boolean;
+  onSelect: (id: string, checked: boolean) => void;
+}) {
+  const name = item.plan.sourcePath.split(/[\\/]/).pop();
+  const folder = item.plan.sourcePath.split(/[\\/]/).slice(0, -1).join("/") || "-";
+  return (
+    <tr>
+      <td>
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(event) => onSelect(item.itemId, event.target.checked)}
+        />
+      </td>
+      <td>{name}</td>
+      <td title={item.plan.sourcePath}>{folder}</td>
+      <td>{item.plan.width && item.plan.height ? `${item.plan.width}x${item.plan.height}` : "n/a"}</td>
+      <td>{formatDuration(item.plan.duration)}</td>
+      <td>{item.plan.sourceBitrate ? `${Math.round(item.plan.sourceBitrate / 1000)} kbps` : "n/a"}</td>
+      <td>{item.plan.targetBitrate ? `${Math.round(item.plan.targetBitrate / 1000)} kbps` : "n/a"}</td>
+      <td>{item.plan.encoder ? `${item.plan.encoder} (${item.plan.backend})` : "n/a"}</td>
+      <td title={item.plan.outputPath}>{item.plan.outputPath.split(/[\\/]/).pop()}</td>
+      <td>{item.plan.warnings.length ? "Warn" : ""}</td>
+      <td>{item.status}</td>
+      <td>{item.status === "queued" ? "-" : `${item.progress.percent.toFixed(1)}%`}</td>
+    </tr>
+  );
+});
+
+function QueueTable({
+  items,
+  selected,
+  onSelect,
+  t,
+}: {
+  items: QueueItemDto[];
+  selected: string[];
+  onSelect: (id: string, checked: boolean) => void;
+  t: (key: string, fallback: string) => string;
+}) {
+  const headers: [string, string][] = [
+    ["gui.table.name", "Name"],
+    ["gui.table.folder", "Folder"],
+    ["gui.table.resolution", "Resolution"],
+    ["gui.table.duration", "Duration"],
+    ["gui.table.source_bitrate", "Source bitrate"],
+    ["gui.table.target_bitrate", "Target bitrate"],
+    ["gui.table.encoder", "Encoder"],
+    ["gui.table.output", "Output"],
+    ["gui.table.tags", "Tags"],
+    ["gui.table.status", "Status"],
+    ["gui.table.progress", "Progress"],
+  ];
+  const [visibleCount, setVisibleCount] = useState(QUEUE_VISIBLE_CHUNK);
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
+  const visibleItems = useMemo(() => items.slice(0, visibleCount), [items, visibleCount]);
+  const handleSelect = useCallback(
+    (id: string, checked: boolean) => onSelect(id, checked),
+    [onSelect],
+  );
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th aria-label="select" />
+            {headers.map(([key, fallback]) => (
+              <th key={key}>{t(key, fallback)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {visibleItems.map((item) => (
+            <QueueRow
+              key={item.itemId}
+              item={item}
+              checked={selectedSet.has(item.itemId)}
+              onSelect={handleSelect}
+            />
+          ))}
+        </tbody>
+      </table>
+      {items.length === 0 && (
+        <div className="empty-table">{t("gui.message.queue_empty", "No jobs have been planned yet.")}</div>
+      )}
+      {visibleCount < items.length && (
+        <div className="inline-actions">
+          <button type="button" onClick={() => setVisibleCount((count) => count + QUEUE_VISIBLE_CHUNK)}>
+            {t("gui.button.show_more", "Show more")} ({visibleCount}/{items.length})
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function AuxiliaryWindow({ kind }: { kind: AuxiliaryKind }) {
@@ -531,12 +668,51 @@ function QueuePanel({ snapshot, t }: { snapshot: QueueSnapshotDto; t: (key: stri
   return <><p className="panel-summary">{t("gui.summary.states", "States")}: {snapshot.metrics.queuedItems} queued / {snapshot.metrics.runningItems} running / {snapshot.metrics.failedItems} failed</p><p className="queue-progress">{snapshot.metrics.queuePercent.toFixed(1)}% ({snapshot.metrics.completedItems}/{snapshot.metrics.totalItems}) · ETA {formatDuration(snapshot.metrics.etaSec)}</p><progress max="100" value={snapshot.metrics.queuePercent} />{message && <p role="alert">{message}</p>}<div className="inline-actions"><button disabled={retryIds.length === 0} onClick={() => run(() => api.queueRetry(retryIds))}>{t("gui.button.retry", "Retry")}</button><button disabled={selected.length === 0} onClick={() => run(() => api.removeQueue(selected))}>{t("gui.button.remove", "Remove")}</button><button onClick={() => move(-1)}>↑</button><button onClick={() => move(1)}>↓</button><button onClick={() => run(() => api.clearCompleted())}>{t("gui.button.clear_completed", "Clear completed")}</button></div><QueueTable items={snapshot.state.items} selected={selected} onSelect={updateSelection} t={t} /></>;
 }
 
+const ActivityRow = React.memo(function ActivityRow({ event }: { event: ActivityEventDto }) {
+  return (
+    <div className="activity-row">
+      <time>{event.timestamp}</time>
+      <strong>{event.category}</strong>
+      <span>{event.message}</span>
+    </div>
+  );
+});
+
 function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) {
   const [events, setEvents] = useState<ActivityEventDto[]>([]);
   const [filter, setFilter] = useState("all");
   const [message, setMessage] = useState("");
-  useEffect(() => { api.activityHistory().then(setEvents).catch(() => undefined); api.subscribeActivity((message) => { if (message.type === "activity") setEvents((current) => [...current, message.data].slice(-500)); }).catch(() => undefined); }, []);
-  const visible = filter === "all" ? events : events.filter((event) => event.category === filter);
+  useEffect(() => {
+    let disposed = false;
+    let handle: SubscriptionHandle | undefined;
+    api.activityHistory(ACTIVITY_UI_LIMIT)
+      .then((history) => {
+        if (!disposed) setEvents(history.slice(-ACTIVITY_UI_LIMIT));
+      })
+      .catch(() => undefined);
+    void api
+      .subscribeActivity((message) => {
+        if (message.type === "activity") {
+          setEvents((current) => [...current, message.data].slice(-ACTIVITY_UI_LIMIT));
+        }
+      })
+      .then((value) => {
+        if (disposed) {
+          void value.unsubscribe();
+        } else {
+          handle = value;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      void handle?.unsubscribe();
+    };
+  }, []);
+  const visible = useMemo(
+    () => (filter === "all" ? events : events.filter((event) => event.category === filter)).slice(-ACTIVITY_UI_LIMIT),
+    [events, filter],
+  );
   async function clear() {
     try {
       await api.activityClear();
@@ -553,7 +729,35 @@ function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) 
       setMessage(errorText(error));
     }
   }
-  return <><div className="activity-controls"><label>{t("gui.label.log_filter", "Log filter")}<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">{t("gui.filter.all", "All")}</option><option value="command">{t("gui.filter.command", "Command")}</option><option value="process">{t("gui.filter.process", "Process")}</option><option value="error">{t("gui.filter.error", "Error")}</option></select></label><div className="inline-actions"><button onClick={exportLog}>{t("gui.button.export_log", "Export Log")}</button><button onClick={clear}>{t("gui.button.clear_log", "Clear Log")}</button></div></div>{message && <p role="alert">{message}</p>}<div className="activity-list">{visible.length === 0 ? <p>{t("gui.message.activity_empty", "No activity yet.")}</p> : visible.map((event, index) => <div className="activity-row" key={`${event.timestamp}-${index}`}><time>{event.timestamp}</time><strong>{event.category}</strong><span>{event.message}</span></div>)}</div></>;
+  return (
+    <>
+      <div className="activity-controls">
+        <label>
+          {t("gui.label.log_filter", "Log filter")}
+          <select value={filter} onChange={(event) => setFilter(event.target.value)}>
+            <option value="all">{t("gui.filter.all", "All")}</option>
+            <option value="command">{t("gui.filter.command", "Command")}</option>
+            <option value="process">{t("gui.filter.process", "Process")}</option>
+            <option value="error">{t("gui.filter.error", "Error")}</option>
+          </select>
+        </label>
+        <div className="inline-actions">
+          <button onClick={exportLog}>{t("gui.button.export_log", "Export Log")}</button>
+          <button onClick={clear}>{t("gui.button.clear_log", "Clear Log")}</button>
+        </div>
+      </div>
+      {message && <p role="alert">{message}</p>}
+      <div className="activity-list" data-testid="activity-list" data-count={visible.length}>
+        {visible.length === 0 ? (
+          <p>{t("gui.message.activity_empty", "No activity yet.")}</p>
+        ) : (
+          visible.map((event, index) => (
+            <ActivityRow key={`${event.timestamp}-${index}`} event={event} />
+          ))
+        )}
+      </div>
+    </>
+  );
 }
 
 function PresetPanel({ initial, appSettings, t }: { initial: SettingsDto; appSettings: AppSettingsDto; t: (key: string, fallback: string) => string }) {

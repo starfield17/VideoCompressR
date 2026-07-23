@@ -120,9 +120,10 @@ vi.mock("./api/client", () => ({
   api: {
     bootstrap: vi.fn().mockResolvedValue({ language: "en", defaultPresetName: "default_hevc", ffmpegPath: null, ffprobePath: null, settings: testData.settings, appSettings: testData.appSettings, queue: testData.queue }),
     listPresets: vi.fn().mockResolvedValue(["default_hevc"]),
-    subscribeQueue: vi.fn().mockResolvedValue(undefined),
-    subscribeActivity: vi.fn().mockResolvedValue(undefined),
+    subscribeQueue: vi.fn().mockResolvedValue({ id: "q-1", unsubscribe: vi.fn().mockResolvedValue(undefined) }),
+    subscribeActivity: vi.fn().mockResolvedValue({ id: "a-1", unsubscribe: vi.fn().mockResolvedValue(undefined) }),
     activityHistory: vi.fn().mockResolvedValue([]),
+    subscriptionCount: vi.fn().mockResolvedValue(0),
     activityClear: vi.fn(),
     exportActivity: vi.fn(),
     redetectEncoders: vi.fn(),
@@ -161,8 +162,8 @@ beforeEach(() => {
     queue: testData.queue,
   }));
   vi.mocked(api.listPresets).mockResolvedValue(["default_hevc"]);
-  vi.mocked(api.subscribeQueue).mockResolvedValue(undefined);
-  vi.mocked(api.subscribeActivity).mockResolvedValue(undefined);
+  vi.mocked(api.subscribeQueue).mockResolvedValue({ id: "q-1", unsubscribe: vi.fn().mockResolvedValue(undefined) });
+  vi.mocked(api.subscribeActivity).mockResolvedValue({ id: "a-1", unsubscribe: vi.fn().mockResolvedValue(undefined) });
   vi.mocked(api.activityHistory).mockResolvedValue([]);
   vi.mocked(api.plan).mockResolvedValue(planResponse);
   vi.mocked(api.addToQueue).mockResolvedValue(planResponse);
@@ -179,6 +180,7 @@ beforeEach(() => {
   testHooks.queueMessageHandler = undefined;
   vi.mocked(api.subscribeQueue).mockImplementation(async (handler) => {
     testHooks.queueMessageHandler = handler;
+    return { id: "q-1", unsubscribe: vi.fn().mockResolvedValue(undefined) };
   });
 });
 
@@ -484,4 +486,33 @@ test("settings window saves language and app paths", async () => {
     language: "zh_cn",
     workdirPath: "/settings-work",
   })));
+});
+
+test("activity panel never renders more than history limit", async () => {
+  const many = Array.from({ length: 800 }, (_, index) => ({
+    category: "process",
+    message: `line-${index}`,
+    timestamp: `t-${index}`,
+  }));
+  vi.mocked(api.activityHistory).mockResolvedValueOnce(many.slice(-500));
+  window.history.pushState({}, "", "/?window=activity");
+  render(<App />);
+  await screen.findByRole("heading", { name: "Activity Log" });
+  await waitFor(() => {
+    const list = screen.getByTestId("activity-list");
+    expect(Number(list.getAttribute("data-count"))).toBeLessThanOrEqual(500);
+  });
+});
+
+test("queue subscription is cleaned up on unmount", async () => {
+  const unsubscribe = vi.fn().mockResolvedValue(undefined);
+  vi.mocked(api.subscribeQueue).mockImplementation(async (handler) => {
+    testHooks.queueMessageHandler = handler;
+    return { id: "q-cleanup", unsubscribe };
+  });
+  const view = render(<App />);
+  await screen.findByText("Source Setup");
+  await waitFor(() => expect(api.subscribeQueue).toHaveBeenCalled());
+  view.unmount();
+  await waitFor(() => expect(unsubscribe).toHaveBeenCalled());
 });

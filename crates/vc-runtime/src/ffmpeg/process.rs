@@ -154,19 +154,27 @@ where
         .stderr
         .take()
         .ok_or_else(|| RuntimeError::Encode("FFmpeg stderr pipe was unavailable".into()))?;
-    let (tx, mut rx) = mpsc::unbounded_channel::<ProcessLine>();
+    // Bounded channel: stdout (machine progress) may drop under backpressure;
+    // stderr diagnostics await capacity so they are not silently lost.
+    let (tx, mut rx) = mpsc::channel::<ProcessLine>(1_024);
     let stdout_tx = tx.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let _ = stdout_tx.send(ProcessLine { stream: OutputStream::Stdout, text: line });
+            let _ = stdout_tx.try_send(ProcessLine { stream: OutputStream::Stdout, text: line });
         }
     });
     let stderr_tx = tx.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let _ = stderr_tx.send(ProcessLine { stream: OutputStream::Stderr, text: line });
+            if stderr_tx
+                .send(ProcessLine { stream: OutputStream::Stderr, text: line })
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
     });
     drop(tx);
