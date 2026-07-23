@@ -35,12 +35,20 @@ export const api = {
   deletePreset: (name: string) => invoke<void>("preset_delete", { name }),
   preview: (request: PlanRequestDto, options: PreviewOptionsDto) => invoke<PreviewResultDto>("preview", { request, options }),
   subscribeQueue: (onMessage: (message: QueueStreamMessage) => void) => {
-    const channel = queueChannel(onMessage);
-    return invoke<void>("queue_subscribe", { channel });
+    try {
+      const channel = queueChannel(onMessage);
+      return invoke<void>("queue_subscribe", { channel });
+    } catch (error) {
+      return Promise.reject(error);
+    }
   },
   subscribeActivity: (onMessage: (message: QueueStreamMessage) => void) => {
-    const channel = queueChannel(onMessage);
-    return invoke<void>("activity_subscribe", { channel });
+    try {
+      const channel = queueChannel(onMessage);
+      return invoke<void>("activity_subscribe", { channel });
+    } catch (error) {
+      return Promise.reject(error);
+    }
   },
   activityHistory: () => invoke<ActivityEventDto[]>("activity_history"),
   activityClear: () => invoke<void>("activity_clear"),
