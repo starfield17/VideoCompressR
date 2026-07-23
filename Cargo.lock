@@ -3926,7 +3926,7 @@ dependencies = [
 
 [[package]]
 name = "vc-core"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3935,7 +3935,7 @@ dependencies = [
 
 [[package]]
 name = "vc-runtime"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "directories",
  "libc",
@@ -3953,7 +3953,7 @@ dependencies = [
 
 [[package]]
 name = "vc-testkit"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -3975,7 +3975,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video-compressor"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "clap",
  "serde_json",
@@ -3988,7 +3988,7 @@ dependencies = [
 
 [[package]]
 name = "video-compressor-desktop"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "serde",
  "serde_json",

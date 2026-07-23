@@ -855,9 +855,12 @@ pub fn run() {
             subscriptions: SubscriptionRegistry::default(),
         })
         .setup(move |app| {
-            geometry_for_setup
-                .start()
-                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+            let geometry_for_worker = geometry_for_setup.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = geometry_for_worker.start() {
+                    eprintln!("geometry worker failed to start: {error}");
+                }
+            });
             if let Some(window) = app.get_webview_window("main") {
                 if let Some(cached) = geometry_for_setup.get(window.label()) {
                     restore_window_geometry_from_cache(&window, &cached);

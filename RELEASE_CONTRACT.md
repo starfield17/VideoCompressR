@@ -13,6 +13,8 @@ runner supports it. Archives include checksums, a Cargo metadata SBOM,
 `cargo-deny` license output, and a package smoke check. Signing is conditional
 on a future platform-specific signing implementation; the current publish
 workflow always labels artifacts `signing=unsigned` and does not infer signing
-from secret presence. Full FFmpeg bundles require a matching ffmpeg/ffprobe
+from secret presence. Release publication is gated on the native desktop
+startup smoke matrix and the packaged Tauri/WebDriver E2E job in addition to
+the CLI and desktop build matrices. Full FFmpeg bundles require a matching ffmpeg/ffprobe
 pair, target identity, hash, source revision, build flags, and license
 provenance.

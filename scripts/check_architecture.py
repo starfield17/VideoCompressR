@@ -28,6 +28,23 @@ def rust_sources(directory: Path) -> list[Path]:
     return sorted(directory.rglob("*.rs")) if directory.exists() else []
 
 
+def function_body(source: str, name: str) -> str:
+    match = re.search(rf"\bfn\s+{re.escape(name)}\b[^{{]*\{{", source)
+    if not match:
+        fail(f"cannot find Rust function {name}")
+    depth = 0
+    for index in range(match.end() - 1, len(source)):
+        character = source[index]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[match.end():index]
+    fail(f"cannot parse Rust function {name}")
+    raise AssertionError
+
+
 def main() -> int:
     core_manifest = read(ROOT / "crates/vc-core/Cargo.toml")
     forbidden_core_dependencies = ("tokio", "tauri", "clap", "directories")
@@ -43,6 +60,30 @@ def main() -> int:
     ):
         if re.search(pattern, core_text):
             fail(reason)
+
+    runtime_manifest = read(ROOT / "crates/vc-runtime/Cargo.toml")
+    if re.search(r"^\s*tauri\s*=", runtime_manifest, re.MULTILINE):
+        fail("vc-runtime depends on Tauri")
+
+    supervisor_source = read(ROOT / "crates/vc-runtime/src/queue/supervisor.rs")
+    supervisor_constructor = function_body(supervisor_source, "new")
+    if re.search(r"tokio::spawn|spawn_|tokio::time::sleep|\bsleep\s*\(", supervisor_constructor):
+        fail("QueueSupervisor::new starts or schedules background work")
+    force_abort = function_body(supervisor_source, "force_abort_active_run")
+    if "QueueCommand::RecoverRun" not in force_abort:
+        fail("force_abort_active_run must use the queue reducer recovery command")
+    if re.search(r"inner\.state|run_state|active_run_id|\.status\s*=", force_abort):
+        fail("force_abort_active_run writes queue state outside the reducer")
+
+    application_source = read(ROOT / "crates/vc-runtime/src/application.rs")
+    bootstrap = function_body(application_source, "bootstrap")
+    if re.search(r"tokio::spawn|tokio::runtime|Handle::(?:current|try_current)", bootstrap):
+        fail("Application::bootstrap requires or creates a Tokio runtime")
+
+    process_source = read(ROOT / "crates/vc-runtime/src/ffmpeg/process.rs")
+    capture_exact = function_body(process_source, "run_capture_exact")
+    if "try_send" in capture_exact:
+        fail("run_capture_exact may not drop output through try_send")
 
     tauri_text = "\n".join(read(path) for path in rust_sources(ROOT / "apps/desktop/src-tauri/src"))
     for forbidden in ("Command::new", "render_encode_commands", "-progress", "-c:v"):
@@ -67,6 +108,9 @@ def main() -> int:
             fail("window event handler must not save window state on the UI thread")
         if "snapshot_now" not in handler:
             fail("window close path must use queue.snapshot_now() (no block_on)")
+        geometry_callback = function_body(lib_text, "note_geometry")
+        if re.search(r"tokio::spawn|async_runtime::spawn|tokio::time::sleep|\bsleep\s*\(", geometry_callback):
+            fail("geometry event handling must only note the latest geometry")
         for name in (
             "save_settings",
             "save_app_settings",
@@ -105,6 +149,21 @@ def main() -> int:
     generated = read(ROOT / "apps/desktop/src/api/generated.ts")
     if "@generated" not in generated:
         fail("TypeScript DTO bindings are not marked generated")
+
+    frontend_app = read(ROOT / "apps/desktop/src/App.tsx")
+    if re.search(r"ActivityRow[\s\S]{0,500}key={[^}]*index", frontend_app):
+        fail("Activity rows must use a monotonic event identity, not an array index")
+
+    release_workflow = read(ROOT / ".github/workflows/release.yml")
+    for job in ("desktop-startup-smoke:", "packaged-e2e:"):
+        if job not in release_workflow:
+            fail(f"release workflow is missing {job}")
+    if "pnpm tauri build --ci" not in release_workflow:
+        fail("release workflow startup smoke must build the native desktop binary")
+    if "pnpm --dir apps/desktop e2e" not in release_workflow:
+        fail("release workflow is missing packaged desktop E2E")
+    if "needs: [cli, desktop, desktop-startup-smoke, packaged-e2e]" not in release_workflow:
+        fail("release publication must wait for build, startup smoke, and packaged E2E gates")
 
     production_sources = (
         rust_sources(ROOT / "crates/vc-core/src")

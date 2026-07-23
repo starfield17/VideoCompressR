@@ -195,10 +195,16 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn writer_failure_is_returned_by_finish() {
-        let writer = ProcessLogWriter::open(PathBuf::from("/dev/full")).await.expect("open");
-        writer.write_line("this write must fail").await.expect("enqueue");
-        assert!(writer.finish().await.is_err());
+    async fn writer_failure_is_reported_by_open_or_finish() {
+        match ProcessLogWriter::open(PathBuf::from("/dev/full")).await {
+            Ok(writer) => {
+                writer.write_line("this write must fail").await.expect("enqueue");
+                assert!(writer.finish().await.is_err());
+            }
+            Err(error) => {
+                assert!(matches!(error, RuntimeError::Io(_)), "unexpected error: {error:?}")
+            }
+        }
     }
 
     #[tokio::test]
