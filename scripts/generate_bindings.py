@@ -23,6 +23,10 @@ COMMAND = [
 ]
 
 
+def canonicalize(value: bytes) -> bytes:
+    return value.replace(b"\r\n", b"\n")
+
+
 def run_generator(output: Path) -> int:
     result = subprocess.run(
         [*COMMAND, "--output", str(output)],
@@ -47,7 +51,7 @@ def main() -> int:
             return 1
         expected = GENERATED.read_bytes()
         actual = candidate.read_bytes()
-        if expected != actual:
+        if canonicalize(expected) != canonicalize(actual):
             print(f"generated bindings are stale: {GENERATED}; run `pnpm codegen`", flush=True)
             return 1
     print(f"verified generated bindings: {GENERATED}")

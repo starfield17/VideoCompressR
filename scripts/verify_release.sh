@@ -18,8 +18,7 @@ for archive in "${archives[@]}"; do
   test -f "$checksum"
   "$python_cmd" "$script_dir/checksum.py" verify "$checksum"
   if [[ "$archive" == *.zip ]]; then
-    names=$(unzip -Z1 "$archive")
-    unzip -q "$archive" -d "$verify_tmp"
+    names=$("$python_cmd" "$script_dir/zip_release.py" extract "$archive" "$verify_tmp")
   else
     names=$(tar -tzf "$archive")
     tar -xzf "$archive" -C "$verify_tmp"

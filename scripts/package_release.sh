@@ -49,7 +49,7 @@ printf '%s\n' 'signing=unsigned' > "$stage/SIGNING_STATUS.txt"
 
 if [[ "$target" == *-windows-* ]]; then
   archive="${output_dir}/${name}.zip"
-  (cd "$stage_root" && zip -q -r "$archive" "$name")
+  "$python_cmd" "$script_dir/zip_release.py" create "$archive" "$stage_root" "$name"
 else
   archive="${output_dir}/${name}.tar.gz"
   tar -czf "$archive" -C "$stage_root" "$name"
