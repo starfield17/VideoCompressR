@@ -115,7 +115,7 @@ async fn geometry_storm_writes_few_times() {
     let paths = AppPaths::from_root(temp.path());
     paths.ensure().expect("layout");
     let runtime = WindowGeometryRuntime::load(WindowStateStore::new(paths));
-    let mut tasks = Vec::new();
+    runtime.start().expect("start worker");
     for index in 0..10_000 {
         runtime.note_geometry(
             "main",
@@ -127,18 +127,15 @@ async fn geometry_storm_writes_few_times() {
                 maximized: false,
             },
         );
-        let generation = runtime.bump_generation();
-        let runtime = runtime.clone();
-        tasks.push(tokio::spawn(async move {
-            runtime.schedule_save_after(generation, tokio::time::sleep).await;
-        }));
     }
     tokio::time::advance(GEOMETRY_SAVE_DEBOUNCE + Duration::from_millis(100)).await;
-    for task in tasks {
-        let _ = task.await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
     }
+    runtime.shutdown().await;
     assert!(runtime.save_count() <= 2, "writes={}", runtime.save_count());
     assert!(runtime.save_count() >= 1);
+    assert_eq!(runtime.worker_spawn_count(), 1);
 }
 
 #[tokio::test]

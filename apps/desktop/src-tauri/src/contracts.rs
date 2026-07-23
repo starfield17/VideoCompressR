@@ -230,6 +230,8 @@ pub struct QueueSnapshotDto {
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct ActivityEventDto {
+    #[ts(type = "number")]
+    pub sequence: u64,
     pub category: String,
     pub message: String,
     pub timestamp: String,
@@ -241,6 +243,7 @@ pub struct ActivityEventDto {
 pub enum QueueStreamMessage {
     Snapshot(QueueSnapshotDto),
     Activity(ActivityEventDto),
+    ActivityReset { events: Vec<ActivityEventDto> },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]

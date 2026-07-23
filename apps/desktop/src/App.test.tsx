@@ -490,6 +490,7 @@ test("settings window saves language and app paths", async () => {
 
 test("activity panel never renders more than history limit", async () => {
   const many = Array.from({ length: 800 }, (_, index) => ({
+    sequence: index + 1,
     category: "process",
     message: `line-${index}`,
     timestamp: `t-${index}`,

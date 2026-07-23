@@ -694,6 +694,8 @@ function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) 
       .subscribeActivity((message) => {
         if (message.type === "activity") {
           setEvents((current) => [...current, message.data].slice(-ACTIVITY_UI_LIMIT));
+        } else if (message.type === "activityReset") {
+          setEvents(message.data.events.slice(-ACTIVITY_UI_LIMIT));
         }
       })
       .then((value) => {
@@ -751,8 +753,8 @@ function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) 
         {visible.length === 0 ? (
           <p>{t("gui.message.activity_empty", "No activity yet.")}</p>
         ) : (
-          visible.map((event, index) => (
-            <ActivityRow key={`${event.timestamp}-${index}`} event={event} />
+          visible.map((event) => (
+            <ActivityRow key={event.sequence} event={event} />
           ))
         )}
       </div>

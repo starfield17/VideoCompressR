@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -16,6 +17,7 @@ pub const MAX_ACTIVITY_HISTORY_REQUEST: usize = 2_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ActivityEvent {
+    pub sequence: u64,
     pub category: String,
     pub message: String,
     pub timestamp: String,
@@ -25,16 +27,22 @@ pub struct ActivityEvent {
 pub struct ActivityHub {
     sender: broadcast::Sender<ActivityEvent>,
     history: Arc<Mutex<VecDeque<ActivityEvent>>>,
+    next_sequence: Arc<AtomicU64>,
 }
 
 impl ActivityHub {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(512);
-        Self { sender, history: Arc::new(Mutex::new(VecDeque::new())) }
+        Self {
+            sender,
+            history: Arc::new(Mutex::new(VecDeque::new())),
+            next_sequence: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn emit(&self, category: impl Into<String>, message: impl Into<String>) {
         let event = ActivityEvent {
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed) + 1,
             category: category.into(),
             message: message.into(),
             timestamp: format!("{:?}", std::time::SystemTime::now()),
@@ -81,6 +89,10 @@ impl ActivityHub {
         }
     }
 
+    pub fn latest_sequence(&self) -> u64 {
+        self.next_sequence.load(Ordering::Relaxed)
+    }
+
     /// Stream retained events to a file without building a giant intermediate string.
     pub fn export(&self, path: &Path) -> Result<(), RuntimeError> {
         let events = self.history();
@@ -124,6 +136,8 @@ mod tests {
         assert_eq!(tail.len(), 10);
         assert_eq!(tail[0].message, "event-90");
         assert_eq!(tail[9].message, "event-99");
+        assert_eq!(tail[0].sequence, 91);
+        assert_eq!(tail[9].sequence, 100);
     }
 
     #[test]
@@ -135,6 +149,35 @@ mod tests {
         let tail = activity.history_tail(MAX_ACTIVITY_HISTORY_REQUEST + 10_000);
         assert!(tail.len() <= MAX_ACTIVITY_HISTORY_REQUEST);
         assert_eq!(tail.len(), 100);
+    }
+
+    #[test]
+    fn activity_sequence_is_monotonic_across_clear() {
+        let activity = ActivityHub::new();
+        activity.emit("process", "first");
+        activity.clear();
+        activity.emit("process", "second");
+        let history = activity.history();
+        assert_eq!(history[0].sequence, 2);
+        assert_eq!(activity.latest_sequence(), 2);
+    }
+
+    #[tokio::test]
+    async fn lagged_subscriber_continues_after_resync_boundary() {
+        let activity = ActivityHub::new();
+        let mut receiver = activity.subscribe();
+        for index in 0..(512 + 10) {
+            activity.emit("process", format!("event-{index}"));
+        }
+        assert!(matches!(receiver.recv().await, Err(broadcast::error::RecvError::Lagged(_))));
+        activity.emit("process", "after-lag");
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.message == "after-lag" => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => panic!("subscriber closed"),
+            }
+        }
     }
 
     #[test]

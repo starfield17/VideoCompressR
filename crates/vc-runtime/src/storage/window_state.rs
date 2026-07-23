@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 pub const WINDOW_STATE_SCHEMA_VERSION: u32 = 1;
 /// Debounce interval for persisting window geometry after move/resize.
@@ -103,10 +106,32 @@ impl WindowStateStore {
 /// `store.load` / `store.save` or perform filesystem I/O.
 #[derive(Clone)]
 pub struct WindowGeometryRuntime {
+    inner: Arc<WindowGeometryInner>,
+}
+
+struct WindowGeometryInner {
     store: WindowStateStore,
     cache: Arc<Mutex<HashMap<String, WindowGeometry>>>,
     pending: Arc<Mutex<HashMap<String, WindowGeometry>>>,
-    generation: Arc<AtomicU64>,
+    revision: Arc<AtomicU64>,
+    change_tx: watch::Sender<u64>,
+    change_rx: Arc<Mutex<Option<watch::Receiver<u64>>>>,
+    lifecycle: Arc<Mutex<GeometryLifecycle>>,
+    shutdown: CancellationToken,
+    save_count: Arc<AtomicU64>,
+    worker_spawn_count: Arc<AtomicU64>,
+}
+
+struct GeometryLifecycle {
+    started: bool,
+    shutdown: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct GeometryContext {
+    store: WindowStateStore,
+    pending: Arc<Mutex<HashMap<String, WindowGeometry>>>,
     save_count: Arc<AtomicU64>,
 }
 
@@ -116,54 +141,145 @@ impl WindowGeometryRuntime {
             Ok(state) => state.windows.into_iter().collect(),
             Err(_) => HashMap::new(),
         };
+        let (change_tx, change_rx) = watch::channel(0_u64);
         Self {
-            store,
-            cache: Arc::new(Mutex::new(cache)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            generation: Arc::new(AtomicU64::new(0)),
-            save_count: Arc::new(AtomicU64::new(0)),
+            inner: Arc::new(WindowGeometryInner {
+                store,
+                cache: Arc::new(Mutex::new(cache)),
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                revision: Arc::new(AtomicU64::new(0)),
+                change_tx,
+                change_rx: Arc::new(Mutex::new(Some(change_rx))),
+                lifecycle: Arc::new(Mutex::new(GeometryLifecycle {
+                    started: false,
+                    shutdown: false,
+                    handle: None,
+                })),
+                shutdown: CancellationToken::new(),
+                save_count: Arc::new(AtomicU64::new(0)),
+                worker_spawn_count: Arc::new(AtomicU64::new(0)),
+            }),
         }
     }
 
     pub fn store(&self) -> &WindowStateStore {
-        &self.store
+        &self.inner.store
     }
 
     pub fn get(&self, label: &str) -> Option<WindowGeometry> {
-        self.cache.lock().ok().and_then(|cache| cache.get(label).cloned())
+        self.inner.cache.lock().ok().and_then(|cache| cache.get(label).cloned())
     }
 
-    /// Update in-memory geometry only. Returns true if a debounced save should be scheduled.
+    /// Update memory and notify the single debouncer worker; never spawns a task.
     pub fn note_geometry(&self, label: impl Into<String>, geometry: WindowGeometry) -> bool {
         let label = label.into();
-        if let Ok(mut cache) = self.cache.lock() {
+        if let Ok(mut cache) = self.inner.cache.lock() {
             cache.insert(label.clone(), geometry.clone());
         }
-        if let Ok(mut pending) = self.pending.lock() {
+        if let Ok(mut pending) = self.inner.pending.lock() {
             pending.insert(label, geometry);
         }
+        let revision = self.inner.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner.change_tx.send_replace(revision);
         true
     }
 
-    pub fn bump_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    pub fn worker_spawn_count(&self) -> u64 {
+        self.inner.worker_spawn_count.load(Ordering::SeqCst)
     }
 
-    pub fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+    pub fn start(&self) -> Result<(), RuntimeError> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            RuntimeError::Background("geometry worker requires an existing Tokio runtime".into())
+        })?;
+        let mut lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .map_err(|_| RuntimeError::Background("geometry lifecycle lock poisoned".into()))?;
+        if lifecycle.shutdown {
+            return Err(RuntimeError::Background("geometry runtime is shut down".into()));
+        }
+        if lifecycle.started {
+            return Ok(());
+        }
+        let receiver = self
+            .inner
+            .change_rx
+            .lock()
+            .map_err(|_| RuntimeError::Background("geometry receiver lock poisoned".into()))?
+            .take()
+            .ok_or_else(|| {
+                RuntimeError::Background("geometry receiver was already taken".into())
+            })?;
+        let context = self.context();
+        let weak = Arc::downgrade(&self.inner);
+        let cancel = self.inner.shutdown.clone();
+        self.inner.worker_spawn_count.fetch_add(1, Ordering::SeqCst);
+        lifecycle.handle = Some(handle.spawn(run_geometry_worker(weak, context, receiver, cancel)));
+        lifecycle.started = true;
+        Ok(())
     }
 
     pub fn take_pending_snapshot(&self) -> HashMap<String, WindowGeometry> {
-        self.pending.lock().map(|mut pending| std::mem::take(&mut *pending)).unwrap_or_default()
+        self.inner
+            .pending
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
     }
 
     pub fn save_count(&self) -> u64 {
-        self.save_count.load(Ordering::SeqCst)
+        self.inner.save_count.load(Ordering::SeqCst)
     }
 
-    /// Persist pending geometries immediately (intended for spawn_blocking / tests).
+    /// Persist pending geometries immediately (intended for the worker / tests).
     pub fn flush_pending_now(&self) -> Result<(), RuntimeError> {
-        let pending = self.take_pending_snapshot();
+        self.context().flush_pending_now()
+    }
+
+    pub async fn shutdown(&self) {
+        let handle = {
+            let Ok(mut lifecycle) = self.inner.lifecycle.lock() else {
+                return;
+            };
+            if lifecycle.shutdown && lifecycle.handle.is_none() {
+                return;
+            }
+            lifecycle.shutdown = true;
+            self.inner.shutdown.cancel();
+            lifecycle.handle.take()
+        };
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        } else {
+            let context = self.context();
+            let _ = tokio::task::spawn_blocking(move || context.flush_pending_now()).await;
+        }
+    }
+
+    fn context(&self) -> GeometryContext {
+        GeometryContext {
+            store: self.inner.store.clone(),
+            pending: self.inner.pending.clone(),
+            save_count: self.inner.save_count.clone(),
+        }
+    }
+}
+
+impl Drop for WindowGeometryInner {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+impl GeometryContext {
+    fn flush_pending_now(&self) -> Result<(), RuntimeError> {
+        let pending = self
+            .pending
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default();
         if pending.is_empty() {
             return Ok(());
         }
@@ -171,30 +287,56 @@ impl WindowGeometryRuntime {
         self.save_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
 
-    /// Debounced save: only the latest generation actually writes.
-    ///
-    /// `sleeper` is injectable so tests can avoid real wall-clock waits.
-    pub async fn schedule_save_after<F, Fut>(&self, generation: u64, sleeper: F)
-    where
-        F: FnOnce(Duration) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        sleeper(GEOMETRY_SAVE_DEBOUNCE).await;
-        if self.current_generation() != generation {
-            return;
-        }
-        let runtime = self.clone();
-        let result = tokio::task::spawn_blocking(move || runtime.flush_pending_now()).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(error = %error, "window geometry save failed");
+async fn run_geometry_worker(
+    weak: std::sync::Weak<WindowGeometryInner>,
+    context: GeometryContext,
+    mut receiver: watch::Receiver<u64>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                flush_geometry_context(&context).await;
+                break;
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "window geometry save join failed");
+            changed = receiver.changed() => {
+                if changed.is_err() || weak.upgrade().is_none() {
+                    flush_geometry_context(&context).await;
+                    break;
+                }
+                loop {
+                    let deadline = tokio::time::sleep(GEOMETRY_SAVE_DEBOUNCE);
+                    tokio::pin!(deadline);
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            flush_geometry_context(&context).await;
+                            return;
+                        }
+                        changed = receiver.changed() => {
+                            if changed.is_err() {
+                                flush_geometry_context(&context).await;
+                                return;
+                            }
+                        }
+                        _ = &mut deadline => {
+                            flush_geometry_context(&context).await;
+                            break;
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+async fn flush_geometry_context(context: &GeometryContext) {
+    let context = context.clone();
+    match tokio::task::spawn_blocking(move || context.flush_pending_now()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(error = %error, "window geometry save failed"),
+        Err(error) => tracing::warn!(error = %error, "window geometry save join failed"),
     }
 }
 
@@ -234,50 +376,55 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn window_geometry_events_are_debounced() {
         let (_temp, runtime) = runtime();
+        runtime.start().expect("start worker");
         runtime.note_geometry("main", geometry(100, 100));
-        let generation = runtime.bump_generation();
-        let task = {
-            let runtime = runtime.clone();
-            tokio::spawn(async move {
-                runtime.schedule_save_after(generation, tokio::time::sleep).await;
-            })
-        };
         // Before debounce expires: no write yet.
         tokio::time::advance(Duration::from_millis(100)).await;
         assert_eq!(runtime.save_count(), 0);
         tokio::time::advance(GEOMETRY_SAVE_DEBOUNCE).await;
-        task.await.expect("task");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        runtime.shutdown().await;
         assert_eq!(runtime.save_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn window_geometry_burst_writes_once() {
         let (_temp, runtime) = runtime();
-        // Simulate 10_000 events updating memory only, scheduling debounced saves.
-        let mut tasks = Vec::new();
+        runtime.start().expect("start worker");
+        // Simulate 10_000 events updating memory only; one worker owns the debounce timer.
         for index in 0..10_000 {
             runtime.note_geometry("main", geometry(100 + (index % 50) as u32, 200));
-            let generation = runtime.bump_generation();
-            let runtime = runtime.clone();
-            tasks.push(tokio::spawn(async move {
-                runtime.schedule_save_after(generation, tokio::time::sleep).await;
-            }));
         }
         // Only the final generation should survive the debounce window.
         tokio::time::advance(GEOMETRY_SAVE_DEBOUNCE + Duration::from_millis(50)).await;
-        for task in tasks {
-            let _ = task.await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
         }
+        runtime.shutdown().await;
         assert!(
             runtime.save_count() <= 2,
             "expected at most 2 writes after burst, got {}",
             runtime.save_count()
         );
         assert!(runtime.save_count() >= 1, "expected at least one write after debounce");
-        let loaded = runtime.store.load().expect("load");
+        let loaded = runtime.store().load().expect("load");
         let main = loaded.windows.get("main").expect("main geometry");
         // Latest geometry wins (last index 9999 → width 100 + 9999%50 = 149).
         assert_eq!(main.width, 100 + (9_999 % 50) as u32);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn geometry_debouncer_starts_once_and_shutdown_flushes_pending_state() {
+        let (_temp, runtime) = runtime();
+        runtime.start().expect("start worker");
+        runtime.start().expect("second start");
+        assert_eq!(runtime.worker_spawn_count(), 1);
+        runtime.note_geometry("main", geometry(1234, 777));
+        runtime.shutdown().await;
+        assert_eq!(runtime.save_count(), 1);
+        assert_eq!(runtime.store().load().expect("load").windows["main"].width, 1234);
     }
 
     #[test]
@@ -286,7 +433,7 @@ mod tests {
         runtime.note_geometry("main", geometry(100, 100));
         runtime.note_geometry("main", geometry(900, 600));
         runtime.flush_pending_now().expect("flush");
-        let loaded = runtime.store.load().expect("load");
+        let loaded = runtime.store().load().expect("load");
         assert_eq!(loaded.windows.get("main").map(|g| g.width), Some(900));
     }
 

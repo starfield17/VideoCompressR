@@ -113,27 +113,16 @@ fn read_window_geometry(window: &tauri::Window) -> Option<WindowGeometry> {
     })
 }
 
-fn note_and_schedule_geometry(runtime: &WindowGeometryRuntime, window: &tauri::Window) {
+fn note_geometry(runtime: &WindowGeometryRuntime, window: &tauri::Window) {
     let Some(geometry) = read_window_geometry(window) else {
         return;
     };
     runtime.note_geometry(window.label(), geometry);
-    let generation = runtime.bump_generation();
-    let runtime = runtime.clone();
-    tauri::async_runtime::spawn(async move {
-        runtime.schedule_save_after(generation, tokio::time::sleep).await;
-    });
 }
 
-fn flush_geometry_async(runtime: WindowGeometryRuntime) {
+fn shutdown_geometry_async(runtime: WindowGeometryRuntime) {
     tauri::async_runtime::spawn(async move {
-        let result =
-            tauri::async_runtime::spawn_blocking(move || runtime.flush_pending_now()).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!("window geometry flush failed: {error}"),
-            Err(error) => eprintln!("window geometry flush join failed: {error}"),
-        }
+        runtime.shutdown().await;
     });
 }
 
@@ -595,6 +584,7 @@ fn activity_subscribe(
     channel: Channel<QueueStreamMessage>,
 ) -> Result<String, ApiErrorDto> {
     let mut receiver = state.application.activity.subscribe();
+    let activity = state.application.activity.clone();
     let cancel = CancellationToken::new();
     let subscription_id = state.subscriptions.insert(cancel.clone());
     let registry = state.subscriptions.clone();
@@ -604,14 +594,34 @@ fn activity_subscribe(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 event = receiver.recv() => {
-                    let Ok(event) = event else { break; };
-                    let message = QueueStreamMessage::Activity(ActivityEventDto {
-                        category: event.category,
-                        message: event.message,
-                        timestamp: event.timestamp,
-                    });
-                    if channel.send(message).is_err() {
-                        break;
+                    match event {
+                        Ok(event) => {
+                            let message = QueueStreamMessage::Activity(ActivityEventDto {
+                                sequence: event.sequence,
+                                category: event.category,
+                                message: event.message,
+                                timestamp: event.timestamp,
+                            });
+                            if channel.send(message).is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let events = activity
+                                .history_tail(DEFAULT_ACTIVITY_HISTORY_LIMIT)
+                                .into_iter()
+                                .map(|event| ActivityEventDto {
+                                    sequence: event.sequence,
+                                    category: event.category,
+                                    message: event.message,
+                                    timestamp: event.timestamp,
+                                })
+                                .collect();
+                            if channel.send(QueueStreamMessage::ActivityReset { events }).is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
@@ -647,6 +657,7 @@ async fn activity_history(
             .history_tail(limit)
             .into_iter()
             .map(|event| ActivityEventDto {
+                sequence: event.sequence,
                 category: event.category,
                 message: event.message,
                 timestamp: event.timestamp,
@@ -792,6 +803,9 @@ pub fn run() {
             subscriptions: SubscriptionRegistry::default(),
         })
         .setup(move |app| {
+            geometry_for_setup
+                .start()
+                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
             if let Some(window) = app.get_webview_window("main") {
                 if let Some(cached) = geometry_for_setup.get(window.label()) {
                     restore_window_geometry_from_cache(&window, &cached);
@@ -810,13 +824,15 @@ pub fn run() {
             };
             match classify_geometry_event(kind) {
                 GeometryEventKind::MovedOrResized => {
-                    note_and_schedule_geometry(&geometry_for_event, window);
+                    note_geometry(&geometry_for_event, window);
                 }
                 GeometryEventKind::CloseOrDestroyed => {
                     if let Some(geometry) = read_window_geometry(window) {
                         geometry_for_event.note_geometry(window.label(), geometry);
                     }
-                    flush_geometry_async(geometry_for_event.clone());
+                    if kind == "Destroyed" {
+                        shutdown_geometry_async(geometry_for_event.clone());
+                    }
                 }
                 GeometryEventKind::Irrelevant => {}
             }
