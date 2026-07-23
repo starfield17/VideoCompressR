@@ -12,10 +12,9 @@ results.
 | React/Tauri UI | Implemented and locally verified | Plan/Add-to-Queue persistence, error handling, queue controls, Preview, Presets, Settings, and i18n interaction tests pass in `pnpm test:run` (18 passed) |
 | Hosted CI and parity gates | Verified on implementation commit `7db9bb0` | [CI run 29987707554](https://github.com/starfield17/VideoCompressR/actions/runs/29987707554) and [parity run 29987707553](https://github.com/starfield17/VideoCompressR/actions/runs/29987707553) completed successfully on `main` |
 | Packaged Tauri and browser E2E | Verified on implementation commit `7db9bb0` | [Desktop E2E run 29987707590](https://github.com/starfield17/VideoCompressR/actions/runs/29987707590) passed browser Playwright and packaged Tauri WebDriver smoke flows |
-| Cross-platform release | Verified by hosted no-publish dry-run on `7db9bb0` | [Release run 29988026551](https://github.com/starfield17/VideoCompressR/actions/runs/29988026551) passed all 12 CLI/Desktop target jobs; `publish=false` skipped publication as intended |
+| Cross-platform release | v1.0.0 published from `700d163` as an unsigned preview | [Release run 29989250523](https://github.com/starfield17/VideoCompressR/actions/runs/29989250523) passed all 12 CLI/Desktop target jobs and published [GitHub Release v1.0.0](https://github.com/starfield17/VideoCompressR/releases/tag/v1.0.0) with 26 assets |
 
 Known limitations: real GPU encoder behavior remains platform-dependent; the
 release artifacts are intentionally thin and unsigned; code signing and
-notarization are not part of the no-publish dry-run. The implementation
-evidence above covers the full local command matrix plus successful hosted CI,
-E2E, and a manual no-publish release run; no formal release was published.
+notarization are not part of the current release workflow. v1.0.0 is therefore
+an unsigned preview and is not a production release under `RELEASE_CONTRACT.md`.
