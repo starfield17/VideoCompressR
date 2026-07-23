@@ -617,7 +617,25 @@ async fn queue_stop_cancels_all_active_parallel_workers() {
         })
         .await
         .expect("start");
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let snapshot = supervisor.snapshot().await;
+        if snapshot.metrics.running_items >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "parallel queue did not start an item before stop: state={:?}, items={:?}",
+            snapshot.state.run_state,
+            snapshot
+                .state
+                .items
+                .iter()
+                .map(|item| (&item.status, &item.run_id))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     supervisor.stop().await;
     let snapshot = wait_for_idle(&supervisor).await;
     assert!(snapshot.state.items.iter().all(|item| item.status != QueueItemStatus::Running));

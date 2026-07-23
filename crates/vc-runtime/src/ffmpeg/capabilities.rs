@@ -170,13 +170,7 @@ async fn smoke(ffmpeg: &Path, encoder: &str) -> bool {
     }
     let null_output = if cfg!(windows) { "NUL" } else { "-" };
     args.extend(["-f", "null", null_output]);
-    match timeout(Duration::from_secs(10), run(ffmpeg, &args)).await {
-        Ok(Ok((0, _, _))) => true,
-        result => {
-            eprintln!("FFmpeg capability smoke failed for {encoder}: {result:?}");
-            false
-        }
-    }
+    matches!(timeout(Duration::from_secs(10), run(ffmpeg, &args)).await, Ok(Ok((0, _, _))))
 }
 
 async fn detect_capabilities(tools: &ToolPaths) -> Result<CapabilitySnapshot, RuntimeError> {
