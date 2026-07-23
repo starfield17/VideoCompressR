@@ -21,6 +21,9 @@ if [[ "$joined" == *'-h encoder='* ]]; then
   printf '       slow\n       medium\n'
   exit 0
 fi
+if [[ "$joined" == *-c:v* && "$joined" == *'-f null'* ]]; then
+  exit 0
+fi
 if [[ "$joined" == *fail-item* && "$joined" == *pipe:1* ]]; then
   printf 'item failure\n' >&2
   exit 17

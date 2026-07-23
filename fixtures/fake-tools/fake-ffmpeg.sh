@@ -22,6 +22,9 @@ if printf '%s\n' "$*" | grep -q -- '-h encoder='; then
   printf '       slow\n       medium\n'
   exit 0
 fi
+if printf '%s\n' "$*" | grep -q -- '-c:v' && printf '%s\n' "$*" | grep -q -- '-f null'; then
+  exit 0
+fi
 
 if printf '%s\n' "$*" | grep -q -- 'pipe:1'; then
   printf 'frame=1\nout_time_us=500000\nspeed=1x\nprogress=continue\n'
