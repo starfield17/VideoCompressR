@@ -57,6 +57,7 @@ async fn parallel_items(
             .await
             .expect("plan");
         let mut item = plan.items.remove(0);
+        assert!(item.is_ready(), "parallel fixture plan was skipped: {:?}", item.skip_reason);
         item.settings.parallel_enabled = true;
         item.settings.parallel_backends = backends.clone();
         item.settings.encoder_preset = None;
@@ -203,7 +204,7 @@ async fn fake_tools_produce_a_real_runtime_plan_without_reference_tree() {
         .await
         .expect("plan");
     assert_eq!(plan.items.len(), 1);
-    assert!(plan.items[0].is_ready());
+    assert!(plan.items[0].is_ready(), "fixture plan was skipped: {:?}", plan.items[0].skip_reason);
     assert_eq!(plan.items[0].encoder.as_ref().expect("encoder").encoder_name, "libx265");
     let commands =
         render_encode_commands(&plan.ffmpeg_path, &plan.items[0], &paths, None, None, "encode")
@@ -392,7 +393,7 @@ async fn external_subtitle_sidecars_are_copied_with_the_encoded_stem() {
     )
     .await
     .expect("encode");
-    assert!(result.item_result.success);
+    assert!(result.item_result.success, "fixture encode failed: {:?}", result.item_result.error);
     assert_eq!(result.copied_external_subtitle_paths.len(), 1);
     assert!(result.copied_external_subtitle_paths[0].is_file());
     assert!(
