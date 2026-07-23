@@ -16,6 +16,11 @@ export const config = {
   logLevel: "info",
   framework: "mocha",
   reporters: ["spec"],
-  services: [["@wdio/tauri-service", { driverProvider: "external" }]],
+  services: [["@wdio/tauri-service", {
+    backendLogLevel: "debug",
+    captureBackendLogs: true,
+    captureFrontendLogs: true,
+    driverProvider: "external",
+  }]],
   mochaOpts: { timeout: 120000 },
 };
