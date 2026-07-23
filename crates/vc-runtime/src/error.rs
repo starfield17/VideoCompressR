@@ -22,6 +22,8 @@ pub enum RuntimeError {
     Cancelled,
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("background lifecycle error: {0}")]
+    Background(String),
     #[error("queue error: {0}")]
     Queue(#[from] vc_core::queue::QueueError),
 }

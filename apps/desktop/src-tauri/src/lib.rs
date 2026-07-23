@@ -176,7 +176,9 @@ fn api_error(error: RuntimeError) -> ApiErrorDto {
         RuntimeError::ToolDiscovery(_) => "tool_discovery",
         RuntimeError::Capability(_) => "capability",
         RuntimeError::Planning(_) | RuntimeError::Probe(_) => "planning",
-        RuntimeError::Encode(_) | RuntimeError::Cancelled => "execution",
+        RuntimeError::Encode(_) | RuntimeError::Cancelled | RuntimeError::Background(_) => {
+            "execution"
+        }
         RuntimeError::Config(_) => "configuration",
         RuntimeError::Queue(_) => "queue",
         RuntimeError::Io(_) | RuntimeError::Json(_) | RuntimeError::ToolFailed { .. } => "runtime",

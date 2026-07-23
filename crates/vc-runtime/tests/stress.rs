@@ -45,6 +45,7 @@ fn activity_emit_100k_stays_bounded() {
 #[tokio::test(start_paused = true)]
 async fn large_queue_progress_snapshot_rate_is_bounded() {
     let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.initialize().await.expect("initialize");
     let items: Vec<_> = (0..1_000).map(|index| plan_item(&format!("item-{index}"))).collect();
     supervisor.enqueue(items).await.expect("enqueue");
     let run_id = "stress-run".to_owned();

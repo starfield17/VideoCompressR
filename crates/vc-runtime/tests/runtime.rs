@@ -10,6 +10,7 @@ use vc_core::{
 };
 use vc_runtime::ActivityHub;
 use vc_runtime::AppPaths;
+use vc_runtime::Application;
 use vc_runtime::execution::{
     ProgressEvent, ProgressSink, execute_item, execute_plan, execute_preview,
 };
@@ -561,6 +562,16 @@ fn activity_hub_emit_reaches_subscribers() {
     let event = receiver.try_recv().expect("activity event");
     assert_eq!(event.category, "process");
     assert_eq!(event.message, "worker started");
+}
+
+#[test]
+fn application_bootstrap_does_not_require_tokio_runtime() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    let application = Application::bootstrap(paths).expect("bootstrap");
+
+    assert_eq!(application.queue.progress_worker_spawns(), 0);
+    assert_eq!(application.queue.snapshot_worker_spawns(), 0);
 }
 
 #[tokio::test]
