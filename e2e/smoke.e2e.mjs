@@ -13,7 +13,10 @@ describe("desktop smoke", () => {
     const source = $('input[placeholder="Select a source file or directory"]');
     await source.setValue(sourcePath);
     await $("button=◇ Plan").click();
-    await expect($(".plan-note")).toHaveTextContaining("Items: 1");
+    await browser.waitUntil(async () => (await $(".plan-note").getText()).includes("Items: 1"), {
+      timeout: 30_000,
+      timeoutMsg: "plan summary did not appear",
+    });
 
     await $("button=▤ Add to Queue").click();
     await browser.waitUntil(async () => (await $("tbody tr").isDisplayed()), {
@@ -30,7 +33,10 @@ describe("desktop smoke", () => {
       timeout: 30_000,
       timeoutMsg: "queue item did not enter running state",
     });
-    await expect($(".statusbar")).toHaveTextContaining("running");
+    await browser.waitUntil(async () => (await $(".statusbar").getText()).includes("running"), {
+      timeout: 30_000,
+      timeoutMsg: "status bar did not show running state",
+    });
 
     await $("button=■ Stop").click();
     await browser.waitUntil(async () => (await $("td=cancelled").isExisting()), {
