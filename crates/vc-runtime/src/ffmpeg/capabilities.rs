@@ -170,7 +170,7 @@ async fn smoke(ffmpeg: &Path, encoder: &str) -> bool {
     }
     args.extend(["-f", "null", "-"]);
     match timeout(Duration::from_secs(10), run(ffmpeg, &args)).await {
-        Ok(Ok((code, _, _))) if code == 0 => true,
+        Ok(Ok((0, _, _))) => true,
         result => {
             eprintln!("FFmpeg capability smoke failed for {encoder}: {result:?}");
             false
