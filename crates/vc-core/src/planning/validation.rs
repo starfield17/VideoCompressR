@@ -1,5 +1,12 @@
 use crate::model::{EncodeSettings, EncoderSelection};
 
+pub fn unique_parallel_backends(
+    backends: &[crate::model::EncoderBackend],
+) -> Vec<crate::model::EncoderBackend> {
+    let mut seen = std::collections::HashSet::new();
+    backends.iter().copied().filter(|backend| seen.insert(*backend)).collect()
+}
+
 pub fn validate_parallel_settings(
     settings: &EncodeSettings,
     allow_parallel: bool,
@@ -10,13 +17,10 @@ pub fn validate_parallel_settings(
     if !allow_parallel {
         return Err("Parallel mode is not supported for preview.".into());
     }
-    let mut backends = settings
-        .parallel_backends
-        .iter()
-        .copied()
+    let backends = unique_parallel_backends(&settings.parallel_backends)
+        .into_iter()
         .filter(|value| *value != crate::model::EncoderBackend::Auto)
         .collect::<Vec<_>>();
-    backends.dedup();
     if backends.is_empty() {
         return Err("Parallel mode requires at least one explicit backend.".into());
     }

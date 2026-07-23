@@ -67,6 +67,8 @@ pub struct QueueItem {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct QueueState {
     pub run_state: QueueRunState,
+    #[serde(default)]
+    pub active_run_id: Option<String>,
     pub items: Vec<QueueItem>,
 }
 

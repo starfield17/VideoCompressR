@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(unix)]
+use std::time::Duration;
 
 fn fake(name: &str) -> PathBuf {
     let filename = if cfg!(windows) { format!("{name}.ps1") } else { format!("{name}.sh") };
@@ -58,9 +60,131 @@ fn plan_stdout_stderr_exit_code_and_preset_contract_are_stable() {
 #[test]
 fn invalid_input_uses_planning_exit_code() {
     let temp = tempfile::tempdir().expect("temp");
-    let output = run_cli(temp.path(), &["plan", "missing.mp4"]);
+    let missing = temp.path().join("definitely-missing.mp4");
+    let missing_value = missing.to_string_lossy().into_owned();
+    let output = run_cli(temp.path(), &["plan", &missing_value]);
     assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot access input path"));
+}
+
+#[test]
+fn valid_input_with_missing_tools_uses_tool_exit_code() {
+    let temp = tempfile::tempdir().expect("temp");
+    let source = temp.path().join("video.mp4");
+    std::fs::write(&source, b"fixture").expect("source");
+    let ffmpeg = temp.path().join("missing-ffmpeg");
+    let ffprobe = temp.path().join("missing-ffprobe");
+    let source_value = source.to_string_lossy().into_owned();
+    let ffmpeg_value = ffmpeg.to_string_lossy().into_owned();
+    let ffprobe_value = ffprobe.to_string_lossy().into_owned();
+    let output = run_cli(
+        temp.path(),
+        &["plan", &source_value, "--ffmpeg", &ffmpeg_value, "--ffprobe", &ffprobe_value],
+    );
+    assert_eq!(output.status.code(), Some(3));
     assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn unsupported_input_extension_uses_planning_exit_code() {
+    let temp = tempfile::tempdir().expect("temp");
+    let source = temp.path().join("notes.txt");
+    std::fs::write(&source, b"fixture").expect("source");
+    let source_value = source.to_string_lossy().into_owned();
+    let output = run_cli(temp.path(), &["plan", &source_value]);
+    assert_eq!(output.status.code(), Some(4));
+}
+
+#[test]
+fn empty_input_directory_uses_planning_exit_code() {
+    let temp = tempfile::tempdir().expect("temp");
+    let input = temp.path().join("empty");
+    std::fs::create_dir(&input).expect("input directory");
+    let input_value = input.to_string_lossy().into_owned();
+    let output = run_cli(temp.path(), &["plan", &input_value]);
+    assert_eq!(output.status.code(), Some(4));
+}
+
+#[test]
+fn invalid_preset_uses_configuration_exit_code() {
+    let temp = tempfile::tempdir().expect("temp");
+    let output = run_cli(temp.path(), &["preset", "load", "missing-preset"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn probe_failure_uses_planning_exit_code() {
+    let temp = tempfile::tempdir().expect("temp");
+    let source = temp.path().join("probe-failure.mp4");
+    std::fs::write(&source, b"fixture").expect("source");
+    let ffmpeg = fake("fake-ffmpeg").to_string_lossy().into_owned();
+    let ffprobe = fake("fake-ffprobe-fail").to_string_lossy().into_owned();
+    let source_value = source.to_string_lossy().into_owned();
+    let output = run_cli(
+        temp.path(),
+        &["plan", &source_value, "--backend", "cpu", "--ffmpeg", &ffmpeg, "--ffprobe", &ffprobe],
+    );
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ffprobe fixture failure"));
+}
+
+#[test]
+fn encode_failure_uses_encode_exit_code() {
+    let temp = tempfile::tempdir().expect("temp");
+    let source = temp.path().join("fail-item.mp4");
+    std::fs::write(&source, b"fixture").expect("source");
+    let ffmpeg = fake("fake-ffmpeg-item-fail").to_string_lossy().into_owned();
+    let ffprobe = fake("fake-ffprobe").to_string_lossy().into_owned();
+    let source_value = source.to_string_lossy().into_owned();
+    let output = run_cli(
+        temp.path(),
+        &[
+            "encode",
+            &source_value,
+            "--backend",
+            "cpu",
+            "--overwrite",
+            "--ffmpeg",
+            &ffmpeg,
+            "--ffprobe",
+            &ffprobe,
+        ],
+    );
+    assert_eq!(output.status.code(), Some(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_uses_exit_code_130() {
+    let temp = tempfile::tempdir().expect("temp");
+    let source = temp.path().join("cancel-me.mp4");
+    std::fs::write(&source, b"fixture").expect("source");
+    let ffmpeg = fake("fake-queue-hang").to_string_lossy().into_owned();
+    let ffprobe = fake("fake-ffprobe").to_string_lossy().into_owned();
+    let source_value = source.to_string_lossy().into_owned();
+    let child = Command::new(env!("CARGO_BIN_EXE_video-compressor"))
+        .env("VIDEO_COMPRESSOR_DATA_DIR", temp.path())
+        .args([
+            "encode",
+            &source_value,
+            "--backend",
+            "cpu",
+            "--overwrite",
+            "--ffmpeg",
+            &ffmpeg,
+            "--ffprobe",
+            &ffprobe,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("CLI process");
+    std::thread::sleep(Duration::from_secs(2));
+    let signal =
+        Command::new("kill").args(["-INT", &child.id().to_string()]).status().expect("send SIGINT");
+    assert!(signal.success());
+    let output = child.wait_with_output().expect("CLI output");
+    assert_eq!(output.status.code(), Some(130));
 }
 
 #[test]

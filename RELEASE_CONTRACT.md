@@ -11,6 +11,8 @@ linux-x86_64    linux-arm64
 Each target publishes a CLI archive and a Tauri desktop package where the
 runner supports it. Archives include checksums, a Cargo metadata SBOM,
 `cargo-deny` license output, and a package smoke check. Signing is conditional
-on CI secrets; unsigned artifacts are explicitly labeled. Full FFmpeg bundles
-require a matching ffmpeg/ffprobe pair, target identity, hash, source
-revision, build flags, and license provenance.
+on a future platform-specific signing implementation; the current publish
+workflow always labels artifacts `signing=unsigned` and does not infer signing
+from secret presence. Full FFmpeg bundles require a matching ffmpeg/ffprobe
+pair, target identity, hash, source revision, build flags, and license
+provenance.

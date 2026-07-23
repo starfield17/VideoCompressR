@@ -40,6 +40,16 @@ impl PlanningService {
         Self { paths }
     }
     pub async fn plan(&self, request: PlanRequest) -> Result<EncodePlan, RuntimeError> {
+        let files = collect_video_files(&request.input_path, request.settings.recursive)?;
+        if files.is_empty() {
+            return Err(RuntimeError::Planning("No processable video files were found.".into()));
+        }
+        let input_root = request.input_path.canonicalize().map_err(|error| {
+            RuntimeError::Planning(format!(
+                "Cannot access input path {}: {error}",
+                request.input_path.display()
+            ))
+        })?;
         let workdir = request.workdir.clone().unwrap_or_else(|| self.paths.workdir.clone());
         self.paths.for_workdir(&workdir).ensure()?;
         let tools = discover_tools(
@@ -49,11 +59,6 @@ impl PlanningService {
         )?;
         let capabilities =
             ensure_capabilities(&self.paths, &tools, request.force_capability_refresh).await?;
-        let files = collect_video_files(&request.input_path, request.settings.recursive)?;
-        if files.is_empty() {
-            return Err(RuntimeError::Planning("No processable video files were found.".into()));
-        }
-        let input_root = request.input_path.canonicalize()?;
         let input_is_file = input_root.is_file();
         let output_root = choose_output_root(
             &input_root,
@@ -72,16 +77,14 @@ impl PlanningService {
                 request.settings.codec,
                 request.settings.container,
             );
-            let item = match probe_media_info(&tools.ffprobe, &file.path).await {
-                Ok(media) => plan_item(PlanningInput {
-                    source: media,
-                    output_path: output.clone(),
-                    settings: request.settings.clone(),
-                    capabilities: capabilities.clone(),
-                    output_exists: output.exists(),
-                }),
-                Err(error) => Err(error.to_string()),
-            };
+            let media = probe_media_info(&tools.ffprobe, &file.path).await?;
+            let item = plan_item(PlanningInput {
+                source: media,
+                output_path: output.clone(),
+                settings: request.settings.clone(),
+                capabilities: capabilities.clone(),
+                output_exists: output.exists(),
+            });
             items.push(item.unwrap_or_else(|reason| {
                 skipped_item(file.path, output, request.settings.clone(), reason)
             }));

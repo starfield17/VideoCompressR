@@ -61,7 +61,7 @@ const defaultAppSettings: AppSettingsDto = {
 };
 
 const emptySnapshot: QueueSnapshotDto = {
-  state: { runState: "idle", items: [] },
+  state: { runState: "idle", activeRunId: null, items: [] },
   metrics: {
     totalItems: 0,
     queuedItems: 0,

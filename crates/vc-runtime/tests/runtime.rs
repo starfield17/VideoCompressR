@@ -3,17 +3,22 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
+use vc_core::queue::{QueueItemStatus, QueueRunState};
 use vc_core::{
-    EncodeSettings, EncoderBackend, PreviewJob, PreviewOptions, PreviewSampleMode,
+    EncodePlanItem, EncodeSettings, EncoderBackend, PreviewJob, PreviewOptions, PreviewSampleMode,
     choose_sample_window,
 };
 use vc_runtime::ActivityHub;
 use vc_runtime::AppPaths;
-use vc_runtime::execution::{ProgressEvent, ProgressSink, execute_item, execute_preview};
+use vc_runtime::execution::{
+    ProgressEvent, ProgressSink, execute_item, execute_plan, execute_preview,
+};
+use vc_runtime::ffmpeg::ToolPaths;
 use vc_runtime::ffmpeg::command::render_encode_commands;
 use vc_runtime::ffmpeg::process::{OutputStream, ToolRequest, run_capture, run_streaming};
 use vc_runtime::ffmpeg::progress::{ProgressParser, progress_percent};
-use vc_runtime::planning::{PlanRequest, PlanningService};
+use vc_runtime::planning::{EncodePlan, PlanRequest, PlanningService};
+use vc_runtime::queue::supervisor::{ExecutionContext, QueueSupervisor};
 use vc_runtime::storage::app_config::AppConfig;
 use vc_runtime::storage::presets::PresetStore;
 use vc_runtime::storage::settings::SettingsStore;
@@ -22,6 +27,68 @@ use vc_runtime::storage::window_state::{WindowGeometry, WindowStateStore};
 fn fake(name: &str) -> PathBuf {
     let filename = if cfg!(windows) { format!("{name}.ps1") } else { format!("{name}.sh") };
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/fake-tools").join(filename)
+}
+
+async fn parallel_items(
+    paths: &AppPaths,
+    planning_ffmpeg: PathBuf,
+    names: &[&str],
+    backends: Vec<EncoderBackend>,
+) -> Vec<EncodePlanItem> {
+    let service = PlanningService::new(paths.clone());
+    let mut items = Vec::with_capacity(names.len());
+    for name in names {
+        let source = paths.root.join(name);
+        std::fs::write(&source, b"fixture").expect("source");
+        let mut plan = service
+            .plan(PlanRequest {
+                input_path: source,
+                output_dir: Some(paths.root.join("out")),
+                workdir: None,
+                ffmpeg_path: Some(planning_ffmpeg.clone()),
+                ffprobe_path: Some(fake("fake-ffprobe")),
+                settings: EncodeSettings {
+                    backend: EncoderBackend::Cpu,
+                    overwrite: true,
+                    ..EncodeSettings::default()
+                },
+                force_capability_refresh: true,
+            })
+            .await
+            .expect("plan");
+        let mut item = plan.items.remove(0);
+        item.settings.parallel_enabled = true;
+        item.settings.parallel_backends = backends.clone();
+        item.settings.encoder_preset = None;
+        items.push(item);
+    }
+    items
+}
+
+async fn wait_for_idle(
+    supervisor: &QueueSupervisor,
+) -> vc_runtime::queue::supervisor::QueueSnapshot {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let snapshot = supervisor.snapshot().await;
+        if snapshot.state.run_state == QueueRunState::Idle && snapshot.state.active_run_id.is_none()
+        {
+            return (*snapshot).clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "queue did not become idle: state={:?}, active_run_id={:?}, items={:?}",
+            snapshot.state.run_state,
+            snapshot.state.active_run_id,
+            snapshot
+                .state
+                .items
+                .iter()
+                .map(|item| (&item.status, &item.run_id))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 #[test]
@@ -424,4 +491,134 @@ fn activity_history_can_be_cleared_and_exported() {
     assert!(text.contains("[process] encoded fixture"));
     activity.clear();
     assert!(activity.history().is_empty());
+}
+
+#[test]
+fn activity_hub_emit_reaches_subscribers() {
+    let activity = ActivityHub::new();
+    let mut receiver = activity.subscribe();
+    activity.emit("process", "worker started");
+    let event = receiver.try_recv().expect("activity event");
+    assert_eq!(event.category, "process");
+    assert_eq!(event.message, "worker started");
+}
+
+#[tokio::test]
+async fn parallel_item_failure_does_not_cancel_other_workers() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg-item-fail"),
+        &["missing-output-item.mp4", "success-item.mp4"],
+        vec![EncoderBackend::Cpu, EncoderBackend::Qsv],
+    )
+    .await;
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    supervisor
+        .start(ExecutionContext {
+            paths: paths.clone(),
+            tools: ToolPaths {
+                ffmpeg: fake("fake-ffmpeg-item-fail"),
+                ffprobe: fake("fake-ffprobe"),
+            },
+            activity: ActivityHub::new(),
+        })
+        .await
+        .expect("start");
+    let snapshot = wait_for_idle(&supervisor).await;
+    assert_eq!(snapshot.metrics.failed_items, 1);
+    assert_eq!(snapshot.metrics.done_items, 1);
+    assert!(snapshot.state.items.iter().all(|item| item.status != QueueItemStatus::Running));
+}
+
+#[tokio::test]
+async fn direct_parallel_execution_keeps_successful_items_after_failure() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg-item-fail"),
+        &["missing-output-item.mp4", "success-item.mp4"],
+        vec![EncoderBackend::Cpu, EncoderBackend::Qsv],
+    )
+    .await;
+    let results = execute_plan(
+        &EncodePlan {
+            items,
+            ffmpeg_path: fake("fake-ffmpeg-item-fail"),
+            ffprobe_path: fake("fake-ffprobe"),
+            input_root: paths.root.clone(),
+            output_root: paths.root.join("out"),
+            workdir: paths.workdir.clone(),
+        },
+        &paths,
+        &ActivityHub::new(),
+        CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("parallel execution");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.iter().filter(|result| result.item_result.success).count(), 1);
+    assert_eq!(results.iter().filter(|result| !result.item_result.success).count(), 1);
+}
+
+#[tokio::test]
+async fn backend_worker_failure_does_not_cancel_other_backends() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg"),
+        &["backend-one.mp4", "backend-two.mp4"],
+        vec![EncoderBackend::Nvenc, EncoderBackend::Cpu],
+    )
+    .await;
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    supervisor
+        .start(ExecutionContext {
+            paths: paths.clone(),
+            tools: ToolPaths { ffmpeg: fake("fake-ffmpeg"), ffprobe: fake("fake-ffprobe") },
+            activity: ActivityHub::new(),
+        })
+        .await
+        .expect("start");
+    let snapshot = wait_for_idle(&supervisor).await;
+    assert_eq!(snapshot.metrics.failed_items, 1);
+    assert_eq!(snapshot.metrics.done_items, 1);
+}
+
+#[tokio::test]
+async fn queue_stop_cancels_all_active_parallel_workers() {
+    let temp = tempfile::tempdir().expect("temp");
+    let paths = AppPaths::from_root(temp.path());
+    paths.ensure().expect("layout");
+    let items = parallel_items(
+        &paths,
+        fake("fake-ffmpeg-item-fail"),
+        &["hang-one.mp4", "hang-two.mp4"],
+        vec![EncoderBackend::Cpu, EncoderBackend::Qsv],
+    )
+    .await;
+    let supervisor = QueueSupervisor::new(ActivityHub::new());
+    supervisor.enqueue(items).await.expect("enqueue");
+    supervisor
+        .start(ExecutionContext {
+            paths: paths.clone(),
+            tools: ToolPaths { ffmpeg: fake("fake-queue-hang"), ffprobe: fake("fake-ffprobe") },
+            activity: ActivityHub::new(),
+        })
+        .await
+        .expect("start");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    supervisor.stop().await;
+    let snapshot = wait_for_idle(&supervisor).await;
+    assert!(snapshot.state.items.iter().all(|item| item.status != QueueItemStatus::Running));
+    assert!(snapshot.metrics.cancelled_items >= 1);
 }

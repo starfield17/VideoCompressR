@@ -217,6 +217,8 @@ pub struct QueueMetricsDto {
 pub struct QueueStateDto {
     #[serde(rename = "runState")]
     pub run_state: String,
+    #[serde(rename = "activeRunId")]
+    pub active_run_id: Option<String>,
     pub items: Vec<QueueItemDto>,
 }
 
@@ -235,6 +237,7 @@ pub struct ActivityEventDto {
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)]
 pub enum QueueStreamMessage {
     Snapshot(QueueSnapshotDto),
     Activity(ActivityEventDto),

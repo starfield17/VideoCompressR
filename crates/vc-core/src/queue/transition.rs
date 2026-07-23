@@ -52,6 +52,13 @@ fn check_run(item: &QueueItem, run_id: &str) -> Result<(), QueueError> {
     Ok(())
 }
 
+fn check_active_run(state: &QueueState, run_id: &str) -> Result<(), QueueError> {
+    if run_id.is_empty() || state.active_run_id.as_deref() != Some(run_id) {
+        return Err(QueueError::StaleRun);
+    }
+    Ok(())
+}
+
 pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueError> {
     match command {
         QueueCommand::Enqueue(plans) => {
@@ -76,7 +83,10 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
                 plan,
             }));
         }
-        QueueCommand::StartRun { .. } => {
+        QueueCommand::StartRun { run_id } => {
+            if run_id.is_empty() {
+                return Err(QueueError::StaleRun);
+            }
             if !matches!(state.run_state, QueueRunState::Idle | QueueRunState::Paused) {
                 return Err(QueueError::Busy);
             }
@@ -87,8 +97,10 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
                 });
             }
             state.run_state = QueueRunState::Running;
+            state.active_run_id = Some(run_id);
         }
         QueueCommand::StartItem { item_id, run_id } => {
+            check_active_run(state, &run_id)?;
             let item = item_mut(state, &item_id)?;
             if item.status != QueueItemStatus::Queued {
                 return Err(QueueError::Illegal {
@@ -103,6 +115,7 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
             item.progress = ItemProgress::default();
         }
         QueueCommand::ReportProgress { item_id, run_id, progress } => {
+            check_active_run(state, &run_id)?;
             let item = item_mut(state, &item_id)?;
             check_run(item, &run_id)?;
             if item.status != QueueItemStatus::Running {
@@ -115,6 +128,7 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
                 ItemProgress { percent: progress.percent.clamp(0.0, 100.0), ..progress };
         }
         QueueCommand::Finish { item_id, run_id, result } => {
+            check_active_run(state, &run_id)?;
             let item = item_mut(state, &item_id)?;
             check_run(item, &run_id)?;
             if item.status != QueueItemStatus::Running {
@@ -135,6 +149,7 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
             item.run_id = None;
         }
         QueueCommand::Fail { item_id, run_id, error } => {
+            check_active_run(state, &run_id)?;
             let item = item_mut(state, &item_id)?;
             check_run(item, &run_id)?;
             if item.status != QueueItemStatus::Running {
@@ -148,6 +163,7 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
             item.run_id = None;
         }
         QueueCommand::Cancel { item_id, run_id, reason } => {
+            check_active_run(state, &run_id)?;
             let item = item_mut(state, &item_id)?;
             check_run(item, &run_id)?;
             if item.status != QueueItemStatus::Running {
@@ -166,7 +182,8 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
             }
             state.run_state = QueueRunState::PauseRequested;
         }
-        QueueCommand::PauseComplete { .. } => {
+        QueueCommand::PauseComplete { run_id } => {
+            check_active_run(state, &run_id)?;
             if state.run_state != QueueRunState::PauseRequested {
                 return Err(QueueError::Busy);
             }
@@ -175,8 +192,18 @@ pub fn apply(state: &mut QueueState, command: QueueCommand) -> Result<(), QueueE
             }
             state.run_state = QueueRunState::Paused;
         }
-        QueueCommand::CancelRun { .. } => state.run_state = QueueRunState::Cancelling,
-        QueueCommand::RunIdle { .. } => state.run_state = QueueRunState::Idle,
+        QueueCommand::CancelRun { run_id } => {
+            check_active_run(state, &run_id)?;
+            if !matches!(state.run_state, QueueRunState::Running | QueueRunState::PauseRequested) {
+                return Err(QueueError::Busy);
+            }
+            state.run_state = QueueRunState::Cancelling;
+        }
+        QueueCommand::RunIdle { run_id } => {
+            check_active_run(state, &run_id)?;
+            state.run_state = QueueRunState::Idle;
+            state.active_run_id = None;
+        }
         QueueCommand::Retry { item_ids } => {
             if !matches!(state.run_state, QueueRunState::Idle | QueueRunState::Paused) {
                 return Err(QueueError::Busy);

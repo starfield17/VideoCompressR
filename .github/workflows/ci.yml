@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -12,55 +11,107 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  verify:
-    name: Verify (${{ matrix.os }})
+  rust:
+    name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: rustfmt, clippy
       - name: Install Tauri Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libappindicator3-dev libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev patchelf
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.15.1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - name: Install JavaScript dependencies
-        run: pnpm install --frozen-lockfile
       - name: Rust format
         run: cargo fmt --all -- --check
       - name: Rust lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Rust tests
         run: cargo test --workspace --locked
-      - name: Frontend typecheck
-        run: pnpm typecheck
-      - name: Frontend lint
-        run: pnpm lint
-      - name: Frontend tests
-        run: pnpm test:run
-      - name: Frontend build
-        run: pnpm build
+      - name: Confirm Rust commands keep the worktree clean
+        shell: bash
+        run: git diff --exit-code
 
-  dependency-policy:
-    name: Dependency and architecture policy
+  frontend:
+    name: Frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install Tauri Linux dependencies for DTO codegen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libappindicator3-dev libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev patchelf
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.15.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Check DTO bindings without mutating the checkout
+        run: pnpm codegen:check
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test:run
+      - run: pnpm build
+      - name: Check Tauri resources
+        shell: bash
+        run: |
+          python_cmd=python3
+          if ! command -v "$python_cmd" >/dev/null 2>&1; then python_cmd=python; fi
+          "$python_cmd" scripts/check_tauri_resources.py --require-frontend-dist
+      - name: Confirm frontend commands keep the worktree clean
+        run: git diff --exit-code
+
+  architecture:
+    name: Architecture and dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: taiki-e/install-action@cargo-deny
-      - name: Check architecture boundaries
-        run: python3 scripts/check_architecture.py
-      - name: Check dependency policy
-        run: cargo deny check
+      - run: python3 scripts/check_architecture.py
+      - run: python3 scripts/check_tauri_resources.py
+      - run: python3 scripts/test_checksum.py
+      - run: cargo deny check
+
+  desktop-check:
+    name: Desktop check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libappindicator3-dev libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev patchelf
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.15.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Check Tauri resources
+        shell: bash
+        run: |
+          python_cmd=python3
+          if ! command -v "$python_cmd" >/dev/null 2>&1; then python_cmd=python; fi
+          "$python_cmd" scripts/check_tauri_resources.py --require-frontend-dist
+      - run: cargo check --locked -p video-compressor-desktop --all-targets
+      - name: Confirm desktop checks keep the worktree clean
+        shell: bash
+        run: git diff --exit-code

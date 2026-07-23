@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use vc_core::planning::resolve_encoder;
+use vc_core::planning::{resolve_encoder, unique_parallel_backends};
 use vc_core::queue::ItemResult;
 use vc_core::{EncodePlanItem, EncoderBackend};
 
@@ -44,6 +44,28 @@ pub struct ExecutionResult {
     pub commands: Vec<Vec<String>>,
     pub copied_external_subtitle_paths: Vec<PathBuf>,
     pub external_subtitle_warnings: Vec<String>,
+}
+
+fn failed_execution_result(
+    item: &EncodePlanItem,
+    paths: &AppPaths,
+    error: &RuntimeError,
+) -> ExecutionResult {
+    ExecutionResult {
+        item_result: ItemResult {
+            success: false,
+            skipped: false,
+            return_code: None,
+            output_path: Some(item.output_path.clone()),
+            log_path: Some(paths.logs_dir.join(format!("{}-encode.log", token(&item.source_path)))),
+            error: Some(error.to_string()),
+        },
+        source_path: item.source_path.clone(),
+        output_path: item.output_path.clone(),
+        commands: Vec::new(),
+        copied_external_subtitle_paths: Vec::new(),
+        external_subtitle_warnings: Vec::new(),
+    }
 }
 
 pub async fn execute_plan(
@@ -86,14 +108,15 @@ async fn execute_plan_parallel(
     cancel: CancellationToken,
     sink: Option<ProgressSink>,
 ) -> Result<Vec<ExecutionResult>, RuntimeError> {
-    let mut backends = Vec::new();
-    for backend in
-        plan.items.iter().flat_map(|item| item.settings.parallel_backends.iter().copied())
-    {
-        if backend != EncoderBackend::Auto && !backends.contains(&backend) {
-            backends.push(backend);
-        }
-    }
+    let configured_backends = plan
+        .items
+        .iter()
+        .flat_map(|item| item.settings.parallel_backends.iter().copied())
+        .collect::<Vec<_>>();
+    let backends = unique_parallel_backends(&configured_backends)
+        .into_iter()
+        .filter(|backend| *backend != EncoderBackend::Auto)
+        .collect::<Vec<_>>();
     if backends.is_empty() {
         return Err(RuntimeError::Planning(
             "Parallel mode requires at least one explicit backend.".into(),
@@ -116,20 +139,19 @@ async fn execute_plan_parallel(
     .await?;
     let pending = Arc::new(Mutex::new((0..plan.items.len()).collect::<VecDeque<_>>()));
     let results = Arc::new(Mutex::new(vec![None; plan.items.len()]));
-    let worker_cancel = cancel.child_token();
     let mut workers = Vec::with_capacity(backends.len());
     for backend in backends {
         let pending = pending.clone();
         let results = results.clone();
         let capabilities = capabilities.clone();
-        let worker_cancel = worker_cancel.clone();
+        let queue_cancel = cancel.clone();
         let plan = plan.clone();
         let paths = paths.clone();
         let activity = activity.clone();
         let sink = sink.clone();
         workers.push(tokio::spawn(async move {
             loop {
-                if worker_cancel.is_cancelled() {
+                if queue_cancel.is_cancelled() {
                     return Ok::<(), RuntimeError>(());
                 }
                 let index = { pending.lock().await.pop_front() };
@@ -139,25 +161,43 @@ async fn execute_plan_parallel(
                 let base = plan.items[index].clone();
                 let mut item = base;
                 if item.skip_reason.is_none() {
-                    let selection = resolve_encoder(item.settings.codec, backend, &capabilities)
-                        .map_err(RuntimeError::Planning)?;
+                    let selection =
+                        match resolve_encoder(item.settings.codec, backend, &capabilities) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                results.lock().await[index] = Some(failed_execution_result(
+                                    &item,
+                                    &paths,
+                                    &RuntimeError::Planning(error),
+                                ));
+                                return Ok(());
+                            }
+                        };
                     item.encoder = Some(selection.clone());
                     item.settings.backend = backend;
                     item.settings.parallel_enabled = false;
                     item.settings.encoder_preset = selection.default_preset.clone();
                 }
-                let result = execute_item(
+                let item_cancel = queue_cancel.child_token();
+                let result = match execute_item(
                     &item,
                     &plan.ffmpeg_path,
                     &paths,
                     &activity,
-                    worker_cancel.clone(),
+                    item_cancel,
                     sink.clone(),
                     index + 1,
                     plan.items.len(),
                     None,
                 )
-                .await?;
+                .await
+                {
+                    Ok(value) => value,
+                    Err(RuntimeError::Cancelled) if queue_cancel.is_cancelled() => {
+                        return Err(RuntimeError::Cancelled);
+                    }
+                    Err(error) => failed_execution_result(&item, &paths, &error),
+                };
                 results.lock().await[index] = Some(result);
             }
         }));
@@ -170,13 +210,13 @@ async fn execute_plan_parallel(
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
-                worker_cancel.cancel();
+                cancel.cancel();
             }
             Err(error) => {
                 if first_error.is_none() {
                     first_error = Some(RuntimeError::Encode(error.to_string()));
                 }
-                worker_cancel.cancel();
+                cancel.cancel();
             }
         }
     }

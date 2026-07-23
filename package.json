@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "pnpm --dir apps/desktop dev",
     "build": "pnpm --dir apps/desktop build",
+    "codegen": "python3 scripts/generate_bindings.py",
+    "codegen:check": "python3 scripts/generate_bindings.py --check",
     "lint": "pnpm --dir apps/desktop lint",
     "typecheck": "pnpm --dir apps/desktop typecheck",
     "test": "pnpm --dir apps/desktop test",

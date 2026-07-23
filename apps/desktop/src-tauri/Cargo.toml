@@ -15,10 +15,7 @@ name = "video-compressor-desktop"
 path = "src/main.rs"
 
 [build-dependencies]
-serde.workspace = true
-serde_json.workspace = true
 tauri-build = { version = "2.5", features = [] }
-ts-rs = "10.1"
 
 [dependencies]
 serde.workspace = true

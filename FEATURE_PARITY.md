@@ -12,7 +12,7 @@
 | Preview | `preview_sample.py`, `preview_estimate.py` | core model + runtime service | runtime preview path | Complete |
 | Queue | `gui/queue_state.py`, `queue_manager.py`, parallel tests | core reducer + runtime supervisor | stale-run, serial, parallel controls | Complete |
 | CLI | `cli/cli_entry.py`, `cli_interactive.py` | `apps/cli` | help/contract fixtures | Complete |
-| GUI | `gui_mainwindow.py` and auxiliary windows | Tauri/React | `UX_CONTRACT.md`, 2 Vitest tests, browser smoke, WebdriverIO workflow | Complete; local browser/desktop E2E environment pending |
-| Release | legacy workflow tests and architecture handout | Thin six-target workflow | `RELEASE_CONTRACT.md`, package verifier | Implemented; hosted matrix pending |
+| GUI | `gui_mainwindow.py` and auxiliary windows | Tauri/React | `UX_CONTRACT.md`, 2 Vitest tests, browser smoke, WebdriverIO workflow | Implemented; local browser/desktop E2E environment pending |
+| Release | legacy workflow tests and architecture handout | Thin six-target workflow | `RELEASE_CONTRACT.md`, package verifier | Implemented; hosted matrix pending; artifacts explicitly unsigned |
 
 Reference files remain under `reffer/` and are never required by root builds.

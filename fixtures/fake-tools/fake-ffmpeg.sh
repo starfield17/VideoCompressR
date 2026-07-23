@@ -30,7 +30,7 @@ fi
 
 last=''
 for value in "$@"; do last="$value"; done
-if [ -n "$last" ] && [ "$last" != '-' ] && [ "$last" != '/dev/null' ] && [ "$last" != 'NUL' ]; then
+if [ -n "$last" ] && [ "$last" != '-' ] && [ "$last" != 'pipe:1' ] && [ "$last" != '/dev/null' ] && [ "$last" != 'NUL' ]; then
   mkdir -p "$(dirname "$last")" 2>/dev/null || true
   : > "$last"
 fi

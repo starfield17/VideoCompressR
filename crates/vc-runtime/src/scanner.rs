@@ -50,15 +50,30 @@ fn collect_dir(
     recursive: bool,
     values: &mut Vec<VideoFileItem>,
 ) -> Result<(), RuntimeError> {
-    for entry in std::fs::read_dir(root)? {
-        let path = entry?.path();
+    let entries = std::fs::read_dir(root).map_err(|error| {
+        RuntimeError::Planning(format!("Cannot access input path {}: {error}", root.display()))
+    })?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                RuntimeError::Planning(format!(
+                    "Cannot access input path {}: {error}",
+                    root.display()
+                ))
+            })?
+            .path();
         if path.is_dir() && recursive {
             collect_dir(base, &path, true, values)?;
         }
         if path.is_file() && is_video(&path) {
             values.push(VideoFileItem {
                 relative_path: path.strip_prefix(base).unwrap_or(&path).to_path_buf(),
-                path: path.canonicalize()?,
+                path: path.canonicalize().map_err(|error| {
+                    RuntimeError::Planning(format!(
+                        "Cannot access input path {}: {error}",
+                        path.display()
+                    ))
+                })?,
             });
         }
     }

@@ -5,7 +5,9 @@ use vc_core::model::{
     CapabilitySnapshot, Codec, CompressionRatio, EncodeSettings, EncoderBackend, EncoderCapability,
     MediaInfo,
 };
-use vc_core::planning::{PlanningInput, choose_ratio, compute_target_video_bitrate, plan_item};
+use vc_core::planning::{
+    PlanningInput, choose_ratio, compute_target_video_bitrate, plan_item, unique_parallel_backends,
+};
 use vc_core::queue::{
     ItemProgress, QueueCommand, QueueItemStatus, QueueRunState, QueueState, apply, compute_metrics,
 };
@@ -154,6 +156,102 @@ fn planner_rejects_two_pass_for_hardware_and_existing_output_without_overwrite()
             output_exists: true,
         })
         .is_err()
+    );
+}
+
+#[test]
+fn parallel_backends_are_deduplicated_without_reordering() {
+    assert_eq!(
+        unique_parallel_backends(&[
+            EncoderBackend::Nvenc,
+            EncoderBackend::Qsv,
+            EncoderBackend::Nvenc,
+            EncoderBackend::Cpu,
+            EncoderBackend::Qsv,
+        ]),
+        vec![EncoderBackend::Nvenc, EncoderBackend::Qsv, EncoderBackend::Cpu]
+    );
+}
+
+#[test]
+fn run_level_events_reject_stale_runs_and_clear_the_active_run() {
+    let mut state = QueueState::default();
+    apply(&mut state, QueueCommand::Enqueue(vec![planned("input.mp4", "output.mp4")]))
+        .expect("enqueue");
+    assert_eq!(
+        apply(&mut state, QueueCommand::StartRun { run_id: String::new() }),
+        Err(vc_core::queue::QueueError::StaleRun)
+    );
+    apply(&mut state, QueueCommand::StartRun { run_id: "run-1".into() }).expect("start first run");
+    assert_eq!(state.active_run_id.as_deref(), Some("run-1"));
+
+    apply(&mut state, QueueCommand::PauseAfterCurrent).expect("pause request");
+    assert_eq!(
+        apply(&mut state, QueueCommand::PauseComplete { run_id: "old-run".into() }),
+        Err(vc_core::queue::QueueError::StaleRun)
+    );
+    apply(&mut state, QueueCommand::PauseComplete { run_id: "run-1".into() })
+        .expect("pause complete");
+
+    apply(&mut state, QueueCommand::StartRun { run_id: "run-2".into() }).expect("start second run");
+    assert_eq!(state.active_run_id.as_deref(), Some("run-2"));
+    let item_id = state.items[0].item_id.clone();
+    apply(&mut state, QueueCommand::StartItem { item_id: item_id.clone(), run_id: "run-2".into() })
+        .expect("start item");
+    assert_eq!(
+        apply(
+            &mut state,
+            QueueCommand::Finish {
+                item_id: item_id.clone(),
+                run_id: "run-1".into(),
+                result: vc_core::queue::ItemResult {
+                    success: true,
+                    skipped: false,
+                    return_code: Some(0),
+                    output_path: None,
+                    log_path: None,
+                    error: None,
+                },
+            },
+        ),
+        Err(vc_core::queue::QueueError::StaleRun)
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            QueueCommand::Fail {
+                item_id: item_id.clone(),
+                run_id: "run-1".into(),
+                error: vc_core::queue::JobError { message: "stale".into() },
+            },
+        ),
+        Err(vc_core::queue::QueueError::StaleRun)
+    );
+    assert_eq!(
+        apply(&mut state, QueueCommand::RunIdle { run_id: "run-1".into() }),
+        Err(vc_core::queue::QueueError::StaleRun)
+    );
+    assert_eq!(
+        apply(&mut state, QueueCommand::CancelRun { run_id: "run-1".into() }),
+        Err(vc_core::queue::QueueError::StaleRun)
+    );
+    assert_eq!(state.run_state, QueueRunState::Running);
+    apply(
+        &mut state,
+        QueueCommand::Cancel {
+            item_id,
+            run_id: "run-2".into(),
+            reason: "test cancellation".into(),
+        },
+    )
+    .expect("cancel current item");
+    apply(&mut state, QueueCommand::CancelRun { run_id: "run-2".into() })
+        .expect("cancel current run");
+    apply(&mut state, QueueCommand::RunIdle { run_id: "run-2".into() }).expect("idle current run");
+    assert_eq!(state.active_run_id, None);
+    assert_eq!(
+        apply(&mut state, QueueCommand::RunIdle { run_id: "run-2".into() }),
+        Err(vc_core::queue::QueueError::StaleRun)
     );
 }
 

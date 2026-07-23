@@ -32,6 +32,8 @@ tree cleanup path.
 
 ## D-0006: Generated IPC bindings
 
-Tauri DTOs derive `ts-rs` declarations during the Rust build. The React API
-client imports the generated file, so command payload changes fail at the
-Rust/TypeScript boundary instead of relying on duplicated handwritten types.
+Tauri DTOs derive `ts-rs` declarations through the explicit `pnpm codegen`
+command. The React API client imports the checked-in generated file, and
+`pnpm codegen:check` compares a temporary regeneration without mutating the
+checkout, so command payload changes fail at the Rust/TypeScript boundary
+instead of relying on duplicated handwritten types.

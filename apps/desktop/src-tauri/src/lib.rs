@@ -330,6 +330,7 @@ fn queue_snapshot_to_dto(snapshot: &QueueSnapshot) -> QueueSnapshotDto {
     QueueSnapshotDto {
         state: QueueStateDto {
             run_state: queue_run_state(&snapshot.state.run_state).into(),
+            active_run_id: snapshot.state.active_run_id.clone(),
             items,
         },
         metrics: QueueMetricsDto {

@@ -1,4 +1,4 @@
-use crate::activity::{ActivityEvent, ActivityHub};
+use crate::activity::ActivityHub;
 use crate::error::RuntimeError;
 use crate::execution::{ProgressEvent, ProgressSink, execute_item};
 use crate::ffmpeg::{ToolPaths, capabilities::ensure_capabilities};
@@ -6,9 +6,10 @@ use crate::platform::paths::AppPaths;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use vc_core::EncodePlanItem;
+use vc_core::planning::unique_parallel_backends;
 use vc_core::queue::{
     ItemProgress, QueueCommand, QueueMetrics, QueueState, apply, compute_metrics,
 };
@@ -30,7 +31,6 @@ pub struct ExecutionContext {
 pub struct QueueSupervisor {
     state: Arc<Mutex<QueueState>>,
     snapshots: watch::Sender<Arc<QueueSnapshot>>,
-    activity: broadcast::Sender<ActivityEvent>,
     hub: ActivityHub,
     active_cancel: Arc<Mutex<Option<CancellationToken>>>,
     workdir: Arc<Mutex<Option<PathBuf>>>,
@@ -41,11 +41,9 @@ impl QueueSupervisor {
         let state = QueueState::default();
         let snapshot = Arc::new(QueueSnapshot { state, metrics: QueueMetrics::default() });
         let (snapshots, _) = watch::channel(snapshot);
-        let (activity, _) = broadcast::channel(512);
         Self {
             state: Arc::new(Mutex::new(QueueState::default())),
             snapshots,
-            activity,
             hub,
             active_cancel: Arc::new(Mutex::new(None)),
             workdir: Arc::new(Mutex::new(None)),
@@ -53,9 +51,6 @@ impl QueueSupervisor {
     }
     pub fn subscribe(&self) -> watch::Receiver<Arc<QueueSnapshot>> {
         self.snapshots.subscribe()
-    }
-    pub fn subscribe_activity(&self) -> broadcast::Receiver<ActivityEvent> {
-        self.activity.subscribe()
     }
     pub async fn snapshot(&self) -> Arc<QueueSnapshot> {
         self.snapshots.borrow().clone()
@@ -92,12 +87,17 @@ impl QueueSupervisor {
         if let Some(token) = token {
             token.cancel();
         }
-        let state = self.state.lock().await.run_state.clone();
+        let (state, run_id) = {
+            let state = self.state.lock().await;
+            (state.run_state.clone(), state.active_run_id.clone())
+        };
         if matches!(
             state,
             vc_core::queue::QueueRunState::Running | vc_core::queue::QueueRunState::PauseRequested
         ) {
-            let _ = self.apply(QueueCommand::CancelRun { run_id: String::new() }).await;
+            if let Some(run_id) = run_id {
+                let _ = self.apply(QueueCommand::CancelRun { run_id }).await;
+            }
         }
     }
 
@@ -111,11 +111,12 @@ impl QueueSupervisor {
         let cancel = CancellationToken::new();
         *self.active_cancel.lock().await = Some(cancel.clone());
         let supervisor = self.clone();
+        let cleanup_run_id = run_id.clone();
         tokio::spawn(async move {
             let result = supervisor.run_loop(context, run_id, cancel.clone()).await;
             if let Err(error) = result {
                 supervisor.hub.emit("error", error.to_string());
-                let _ = supervisor.apply(QueueCommand::RunIdle { run_id: String::new() }).await;
+                let _ = supervisor.apply(QueueCommand::RunIdle { run_id: cleanup_run_id }).await;
             }
             *supervisor.active_cancel.lock().await = None;
         });
@@ -285,11 +286,10 @@ impl QueueSupervisor {
             }
             (ids, backends)
         };
-        let mut backends = backends
+        let backends = unique_parallel_backends(&backends)
             .into_iter()
             .filter(|backend| *backend != vc_core::EncoderBackend::Auto)
             .collect::<Vec<_>>();
-        backends.dedup();
         if backends.is_empty() {
             return Err(RuntimeError::Planning(
                 "Parallel mode requires at least one explicit backend.".into(),
@@ -297,18 +297,18 @@ impl QueueSupervisor {
         }
         let capabilities = ensure_capabilities(&context.paths, &context.tools, false).await?;
         let pending = Arc::new(Mutex::new(VecDeque::from(ids)));
-        let worker_cancel = cancel.child_token();
         let mut workers = Vec::with_capacity(backends.len());
         for backend in backends {
             let pending = pending.clone();
             let supervisor = self.clone();
             let context = context.clone();
             let capabilities = capabilities.clone();
-            let worker_cancel = worker_cancel.clone();
+            let worker_cancel = cancel.child_token();
+            let queue_cancel = cancel.clone();
             let run_id = run_id.clone();
             workers.push(tokio::spawn(async move {
                 loop {
-                    if worker_cancel.is_cancelled() {
+                    if queue_cancel.is_cancelled() || worker_cancel.is_cancelled() {
                         return Ok::<(), RuntimeError>(());
                     }
                     if supervisor.state.lock().await.run_state
@@ -360,7 +360,6 @@ impl QueueSupervisor {
                                         error: vc_core::queue::JobError { message: error },
                                     })
                                     .await;
-                                worker_cancel.cancel();
                                 return Ok(());
                             }
                         };
@@ -433,8 +432,7 @@ impl QueueSupervisor {
                                     error: vc_core::queue::JobError { message: error.to_string() },
                                 })
                                 .await;
-                            worker_cancel.cancel();
-                            return Ok(());
+                            continue;
                         }
                     }
                 }
@@ -448,7 +446,7 @@ impl QueueSupervisor {
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
-                    worker_cancel.cancel();
+                    cancel.cancel();
                 }
                 Err(error) => {
                     if first_error.is_none() {
@@ -458,7 +456,7 @@ impl QueueSupervisor {
                                 message: error.to_string(),
                             }));
                     }
-                    worker_cancel.cancel();
+                    cancel.cancel();
                 }
             }
         }

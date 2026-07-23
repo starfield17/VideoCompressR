@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+python_cmd=python3
+if ! command -v "$python_cmd" >/dev/null 2>&1; then
+  python_cmd=python
+fi
+
 kind=${1:?kind is required}
 target=${2:?target is required}
 output_dir=${3:?output directory is required}
@@ -47,5 +53,5 @@ else
   archive="${output_dir}/${name}.tar.gz"
   tar -czf "$archive" -C "$stage_root" "$name"
 fi
-sha256sum "$archive" | sed "s#  .*#  $(basename "$archive")#" > "${archive}.sha256"
+"$python_cmd" "$script_dir/checksum.py" create "$archive"
 printf 'created %s\n' "$archive"

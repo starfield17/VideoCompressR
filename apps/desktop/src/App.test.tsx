@@ -39,7 +39,7 @@ const testData = vi.hoisted(() => ({
     queueTableHeaderState: "",
   },
   queue: {
-    state: { runState: "idle", items: [] },
+    state: { runState: "idle", activeRunId: null, items: [] },
     metrics: {
       totalItems: 0,
       queuedItems: 0,
