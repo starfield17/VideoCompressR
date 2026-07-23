@@ -1,11 +1,12 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { vi } from "vitest";
-import App from "./App";
+import App, { queueStreamReducer } from "./App";
 import { api } from "./api/client";
 import type { AppSettingsDto, PlanResponseDto, QueueItemDto, QueueSnapshotDto, QueueStreamMessage, SettingsDto } from "./api/generated";
 
 const testHooks = vi.hoisted(() => ({
   queueMessageHandler: undefined as ((message: QueueStreamMessage) => void) | undefined,
+  activityMessageHandler: undefined as ((message: QueueStreamMessage) => void) | undefined,
 }));
 
 const testData = vi.hoisted(() => ({
@@ -178,9 +179,14 @@ beforeEach(() => {
   vi.mocked(api.saveAppSettings).mockResolvedValue(undefined);
   vi.mocked(api.openAuxiliary).mockResolvedValue(undefined);
   testHooks.queueMessageHandler = undefined;
+  testHooks.activityMessageHandler = undefined;
   vi.mocked(api.subscribeQueue).mockImplementation(async (handler) => {
     testHooks.queueMessageHandler = handler;
     return { id: "q-1", unsubscribe: vi.fn().mockResolvedValue(undefined) };
+  });
+  vi.mocked(api.subscribeActivity).mockImplementation(async (handler) => {
+    testHooks.activityMessageHandler = handler;
+    return { id: "a-1", unsubscribe: vi.fn().mockResolvedValue(undefined) };
   });
 });
 
@@ -374,6 +380,28 @@ test("queue stream snapshots update the main queue table", async () => {
   expect(await screen.findByText("running", { exact: true })).toBeInTheDocument();
 });
 
+test("progress batches update matching rows without replacing unchanged rows", () => {
+  const first = queueItem("running", "streamed-1");
+  const second = queueItem("running", "streamed-2");
+  const snapshot = queueSnapshot([first, second], "running");
+  const progress = { percent: 72, speed: "2x", elapsedSec: 4, currentPass: 1, totalPasses: 1 };
+  const next = queueStreamReducer(snapshot, {
+    type: "progressBatch",
+    data: {
+      updates: [
+        { itemId: first.itemId, runId: "run-1", progress },
+        { itemId: second.itemId, runId: "stale-run", progress },
+      ],
+      metrics: { ...snapshot.metrics, queuePercent: 72 },
+    },
+  });
+
+  expect(next.state.items[0]).not.toBe(first);
+  expect(next.state.items[0].progress).toEqual(progress);
+  expect(next.state.items[1]).toBe(second);
+  expect(next.metrics.queuePercent).toBe(72);
+});
+
 test("queue auxiliary window retries only failed and cancelled items", async () => {
   const originalQueue = testData.queue;
   testData.queue = queueSnapshot([
@@ -503,6 +531,36 @@ test("activity panel never renders more than history limit", async () => {
     const list = screen.getByTestId("activity-list");
     expect(Number(list.getAttribute("data-count"))).toBeLessThanOrEqual(500);
   });
+});
+
+test("activity stream batches rapid events into one visible update", async () => {
+  try {
+    window.history.pushState({}, "", "/?window=activity");
+    render(<App />);
+    await screen.findByRole("heading", { name: "Activity Log" });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(testHooks.activityMessageHandler).toBeDefined();
+    vi.useFakeTimers();
+
+    await act(async () => {
+      for (let index = 0; index < 100; index += 1) {
+        testHooks.activityMessageHandler?.({
+          type: "activity",
+          data: { sequence: index + 1, category: "process", message: `line-${index}`, timestamp: `t-${index}` },
+        });
+      }
+    });
+    expect(screen.getByTestId("activity-list")).toHaveAttribute("data-count", "0");
+
+    await act(async () => {
+      vi.advanceTimersByTime(100);
+    });
+    expect(screen.getByTestId("activity-list")).toHaveAttribute("data-count", "100");
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("queue subscription is cleaned up on unmount", async () => {

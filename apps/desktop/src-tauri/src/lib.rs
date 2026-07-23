@@ -23,7 +23,9 @@ use vc_core::{
     AudioMode, Codec, CompressionRatio, ContainerFormat, DecodeAcceleration, EncodeSettings,
     EncoderBackend, PreviewOptions, PreviewSampleMode,
 };
-use vc_runtime::queue::supervisor::{DEFAULT_CLOSE_IDLE_TIMEOUT, QueueSnapshot, WaitForIdleError};
+use vc_runtime::queue::supervisor::{
+    DEFAULT_CLOSE_IDLE_TIMEOUT, QueueProgressBatch, QueueSnapshot, WaitForIdleError,
+};
 use vc_runtime::storage::window_state::{
     GeometryEventKind, WindowGeometry, WindowGeometryRuntime, WindowStateStore,
     classify_geometry_event,
@@ -384,33 +386,57 @@ fn queue_snapshot_to_dto(snapshot: &QueueSnapshot) -> QueueSnapshotDto {
             run_id: item.run_id.clone(),
         })
         .collect::<Vec<_>>();
-    let metrics = &snapshot.metrics;
     QueueSnapshotDto {
         state: QueueStateDto {
             run_state: queue_run_state(&snapshot.state.run_state).into(),
             active_run_id: snapshot.state.active_run_id.clone(),
             items,
         },
-        metrics: QueueMetricsDto {
-            total_items: metrics.total_items,
-            queued_items: metrics.queued_items,
-            running_items: metrics.running_items,
-            failed_items: metrics.failed_items,
-            done_items: metrics.done_items,
-            skipped_items: metrics.skipped_items,
-            cancelled_items: metrics.cancelled_items,
-            ready_items: metrics.ready_items,
-            completed_items: metrics.completed_items,
-            total_duration_sec: metrics.total_duration_sec,
-            estimated_saved_bytes: metrics.estimated_saved_bytes,
-            queue_percent: metrics.queue_percent,
-            eta_sec: metrics.eta_sec,
-            current_item_id: metrics.current_item_id.clone(),
-            current_file_name: metrics.current_file_name.clone(),
-            current_file_percent: metrics.current_file_percent,
-            current_speed: metrics.current_speed.clone(),
-        },
+        metrics: queue_metrics_to_dto(&snapshot.metrics),
     }
+}
+
+fn queue_metrics_to_dto(metrics: &vc_core::queue::QueueMetrics) -> QueueMetricsDto {
+    QueueMetricsDto {
+        total_items: metrics.total_items,
+        queued_items: metrics.queued_items,
+        running_items: metrics.running_items,
+        failed_items: metrics.failed_items,
+        done_items: metrics.done_items,
+        skipped_items: metrics.skipped_items,
+        cancelled_items: metrics.cancelled_items,
+        ready_items: metrics.ready_items,
+        completed_items: metrics.completed_items,
+        total_duration_sec: metrics.total_duration_sec,
+        estimated_saved_bytes: metrics.estimated_saved_bytes,
+        queue_percent: metrics.queue_percent,
+        eta_sec: metrics.eta_sec,
+        current_item_id: metrics.current_item_id.clone(),
+        current_file_name: metrics.current_file_name.clone(),
+        current_file_percent: metrics.current_file_percent,
+        current_speed: metrics.current_speed.clone(),
+    }
+}
+
+fn queue_progress_batch_to_dto(
+    batch: &QueueProgressBatch,
+) -> (Vec<contracts::QueueProgressDeltaDto>, QueueMetricsDto) {
+    let updates = batch
+        .updates
+        .iter()
+        .map(|update| contracts::QueueProgressDeltaDto {
+            item_id: update.item_id.clone(),
+            run_id: update.run_id.clone(),
+            progress: QueueProgressDto {
+                percent: update.progress.percent,
+                speed: update.progress.speed.clone(),
+                elapsed_sec: update.progress.elapsed_sec,
+                current_pass: update.progress.current_pass,
+                total_passes: update.progress.total_passes,
+            },
+        })
+        .collect();
+    (updates, queue_metrics_to_dto(&batch.metrics))
 }
 
 #[tauri::command]
@@ -537,6 +563,8 @@ fn queue_subscribe(
     channel: Channel<QueueStreamMessage>,
 ) -> Result<String, ApiErrorDto> {
     let receiver = state.application.queue.subscribe();
+    let progress_receiver = state.application.queue.subscribe_progress();
+    let queue = state.application.queue.clone();
     let initial = receiver.borrow().as_ref().clone();
     channel
         .send(QueueStreamMessage::Snapshot(queue_snapshot_to_dto(&initial)))
@@ -547,6 +575,7 @@ fn queue_subscribe(
     let id_for_task = subscription_id.clone();
     tauri::async_runtime::spawn(async move {
         let mut receiver = receiver;
+        let mut progress_receiver = progress_receiver;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -560,6 +589,29 @@ fn queue_subscribe(
                         .is_err()
                     {
                         break;
+                    }
+                }
+                batch = progress_receiver.recv() => {
+                    match batch {
+                        Ok(batch) => {
+                            let (updates, metrics) = queue_progress_batch_to_dto(&batch);
+                            if channel
+                                .send(QueueStreamMessage::ProgressBatch { updates, metrics })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let snapshot = queue.snapshot_now();
+                            if channel
+                                .send(QueueStreamMessage::Snapshot(queue_snapshot_to_dto(&snapshot)))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }

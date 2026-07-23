@@ -3,12 +3,12 @@ use crate::error::RuntimeError;
 use crate::execution::{ProgressEvent, ProgressSink, execute_item};
 use crate::ffmpeg::{ToolPaths, capabilities::ensure_capabilities};
 use crate::platform::paths::AppPaths;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, mpsc, watch};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vc_core::EncodePlanItem;
@@ -21,12 +21,27 @@ use vc_core::queue::{
 pub const SNAPSHOT_COALESCE_INTERVAL: Duration = Duration::from_millis(200);
 /// Progress events are applied on a single worker; channel bounds memory.
 pub const PROGRESS_CHANNEL_CAPACITY: usize = 256;
+/// Bounded queue for UI progress batches; lagging subscribers can resync from a snapshot.
+pub const PROGRESS_BATCH_CHANNEL_CAPACITY: usize = 256;
 /// Default wait for queue idle on window close.
 pub const DEFAULT_CLOSE_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct QueueSnapshot {
     pub state: QueueState,
+    pub metrics: QueueMetrics,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct QueueProgressDelta {
+    pub item_id: String,
+    pub run_id: String,
+    pub progress: ItemProgress,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct QueueProgressBatch {
+    pub updates: Vec<QueueProgressDelta>,
     pub metrics: QueueMetrics,
 }
 
@@ -77,6 +92,8 @@ struct QueueSupervisorInner {
     /// Progress updates are applied by a single long-lived worker (no per-event spawn).
     progress_tx: mpsc::Sender<ProgressUpdate>,
     progress_rx: Mutex<Option<mpsc::Receiver<ProgressUpdate>>>,
+    pending_progress: Arc<Mutex<HashMap<String, ProgressUpdate>>>,
+    progress_batches: broadcast::Sender<QueueProgressBatch>,
     snapshot_dirty: Arc<AtomicBool>,
     snapshot_notify: Arc<Notify>,
     background_cancel: CancellationToken,
@@ -101,13 +118,15 @@ struct BackgroundLifecycle {
 #[derive(Clone)]
 struct BackgroundContext {
     state: Arc<Mutex<QueueState>>,
-    snapshots: watch::Sender<Arc<QueueSnapshot>>,
     snapshot_dirty: Arc<AtomicBool>,
     snapshot_notify: Arc<Notify>,
     snapshot_publish_count: Arc<AtomicU64>,
     metrics_compute_count: Arc<AtomicU64>,
+    pending_progress: Arc<Mutex<HashMap<String, ProgressUpdate>>>,
+    progress_batches: broadcast::Sender<QueueProgressBatch>,
 }
 
+#[derive(Clone)]
 struct ProgressUpdate {
     item_id: String,
     run_id: String,
@@ -123,6 +142,7 @@ impl QueueSupervisor {
         });
         let (snapshots, _) = watch::channel(snapshot);
         let (progress_tx, progress_rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let (progress_batches, _) = broadcast::channel(PROGRESS_BATCH_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(QueueSupervisorInner {
                 state,
@@ -133,6 +153,8 @@ impl QueueSupervisor {
                 workdir: Arc::new(Mutex::new(None)),
                 progress_tx,
                 progress_rx: Mutex::new(Some(progress_rx)),
+                pending_progress: Arc::new(Mutex::new(HashMap::new())),
+                progress_batches,
                 snapshot_dirty: Arc::new(AtomicBool::new(false)),
                 snapshot_notify: Arc::new(Notify::new()),
                 background_cancel: CancellationToken::new(),
@@ -153,11 +175,12 @@ impl QueueSupervisor {
     fn background_context(&self) -> BackgroundContext {
         BackgroundContext {
             state: self.inner.state.clone(),
-            snapshots: self.inner.snapshots.clone(),
             snapshot_dirty: self.inner.snapshot_dirty.clone(),
             snapshot_notify: self.inner.snapshot_notify.clone(),
             snapshot_publish_count: self.inner.snapshot_publish_count.clone(),
             metrics_compute_count: self.inner.metrics_compute_count.clone(),
+            pending_progress: self.inner.pending_progress.clone(),
+            progress_batches: self.inner.progress_batches.clone(),
         }
     }
 
@@ -218,6 +241,10 @@ impl QueueSupervisor {
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<QueueSnapshot>> {
         self.inner.snapshots.subscribe()
+    }
+
+    pub fn subscribe_progress(&self) -> broadcast::Receiver<QueueProgressBatch> {
+        self.inner.progress_batches.subscribe()
     }
 
     /// Synchronous watch-borrow; safe for UI event threads (no block_on).
@@ -676,13 +703,25 @@ impl QueueSupervisor {
         command: QueueCommand,
         mode: SnapshotPublishMode,
     ) -> Result<(), RuntimeError> {
+        let pending_progress = match &command {
+            QueueCommand::ReportProgress { item_id, run_id, progress } => Some(ProgressUpdate {
+                item_id: item_id.clone(),
+                run_id: run_id.clone(),
+                progress: progress.clone(),
+            }),
+            _ => None,
+        };
         {
             let mut state = self.inner.state.lock().await;
             apply(&mut state, command)?;
         }
+        if let Some(progress) = pending_progress {
+            self.inner.pending_progress.lock().await.insert(progress.item_id.clone(), progress);
+        }
         match mode {
             SnapshotPublishMode::Immediate => {
                 // Clear dirty so a pending coalesced publish does not re-send stale mid-window.
+                self.inner.pending_progress.lock().await.clear();
                 self.inner.snapshot_dirty.store(false, Ordering::SeqCst);
                 self.publish_snapshot_from_state().await;
             }
@@ -755,7 +794,7 @@ async fn run_snapshot_publisher(
                 if !context.snapshot_dirty.swap(false, Ordering::SeqCst) {
                     continue;
                 }
-                publish_snapshot(&context).await;
+                publish_progress_batch(&context).await;
             }
         }
     }
@@ -765,23 +804,48 @@ async fn apply_background_command(
     context: &BackgroundContext,
     command: QueueCommand,
 ) -> Result<(), RuntimeError> {
+    let pending_progress = match &command {
+        QueueCommand::ReportProgress { item_id, run_id, progress } => Some(ProgressUpdate {
+            item_id: item_id.clone(),
+            run_id: run_id.clone(),
+            progress: progress.clone(),
+        }),
+        _ => None,
+    };
     {
         let mut state = context.state.lock().await;
         apply(&mut state, command)?;
+    }
+    if let Some(progress) = pending_progress {
+        context.pending_progress.lock().await.insert(progress.item_id.clone(), progress);
     }
     context.snapshot_dirty.store(true, Ordering::SeqCst);
     context.snapshot_notify.notify_one();
     Ok(())
 }
 
-async fn publish_snapshot(context: &BackgroundContext) {
-    let snapshot = {
+async fn publish_progress_batch(context: &BackgroundContext) {
+    let updates = context
+        .pending_progress
+        .lock()
+        .await
+        .drain()
+        .map(|(_, update)| QueueProgressDelta {
+            item_id: update.item_id,
+            run_id: update.run_id,
+            progress: update.progress,
+        })
+        .collect::<Vec<_>>();
+    if updates.is_empty() {
+        return;
+    }
+    let metrics = {
         let state = context.state.lock().await;
         context.metrics_compute_count.fetch_add(1, Ordering::SeqCst);
-        Arc::new(QueueSnapshot { metrics: compute_metrics(&state), state: state.clone() })
+        compute_metrics(&state)
     };
     context.snapshot_publish_count.fetch_add(1, Ordering::SeqCst);
-    context.snapshots.send_replace(snapshot);
+    let _ = context.progress_batches.send(QueueProgressBatch { updates, metrics });
 }
 
 #[cfg(test)]
@@ -851,6 +915,7 @@ mod tests {
     async fn progress_burst_is_coalesced() {
         let supervisor = QueueSupervisor::new(ActivityHub::new());
         supervisor.initialize().await.expect("initialize");
+        let mut progress_receiver = supervisor.subscribe_progress();
         supervisor.enqueue(vec![plan_item("a")]).await.expect("enqueue");
         let item_id = supervisor.snapshot_now().state.items[0].item_id.clone();
         let run_id = "run-test".to_owned();
@@ -888,6 +953,18 @@ mod tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
+        let mut batch = None;
+        for _ in 0..50 {
+            if let Ok(value) = progress_receiver.try_recv() {
+                batch = Some(value);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let batch = batch.unwrap_or_else(|| panic!("progress batch was not published"));
+        assert_eq!(batch.updates.len(), 1);
+        assert_eq!(batch.updates[0].item_id, item_id);
+        assert_eq!(batch.updates[0].progress.percent, 99.0);
         let published = supervisor.snapshot_publish_count() - before;
         // One coalesce window after structural starts already published immediately.
         assert!(published <= 3, "expected coalesced publishes, got {published}");

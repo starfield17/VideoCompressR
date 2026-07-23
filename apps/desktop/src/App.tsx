@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type SubscriptionHandle } from "./api/client";
 import type {
   ActivityEventDto,
@@ -117,6 +117,25 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+export function queueStreamReducer(
+  snapshot: QueueSnapshotDto,
+  message: QueueStreamMessage,
+): QueueSnapshotDto {
+  if (message.type === "snapshot") return message.data;
+  if (message.type !== "progressBatch") return snapshot;
+
+  const updates = new Map(message.data.updates.map((update) => [update.itemId, update]));
+  const items = snapshot.state.items.map((item) => {
+    const update = updates.get(item.itemId);
+    if (!update || item.status !== "running" || item.runId !== update.runId) return item;
+    return { ...item, progress: update.progress };
+  });
+  return {
+    state: { ...snapshot.state, items },
+    metrics: message.data.metrics,
+  };
+}
+
 function useRuntimeSnapshot(initial: QueueSnapshotDto | null) {
   const [snapshot, setSnapshot] = useState<QueueSnapshotDto>(initial ?? emptySnapshot);
   useEffect(() => {
@@ -124,7 +143,9 @@ function useRuntimeSnapshot(initial: QueueSnapshotDto | null) {
     let handle: SubscriptionHandle | undefined;
     void api
       .subscribeQueue((message: QueueStreamMessage) => {
-        if (message.type === "snapshot") setSnapshot(message.data);
+        if (message.type === "snapshot" || message.type === "progressBatch") {
+          setSnapshot((current) => queueStreamReducer(current, message));
+        }
       })
       .then((value) => {
         if (disposed) {
@@ -170,6 +191,12 @@ function MainWindow() {
   });
   const [previewResult, setPreviewResult] = useState<PreviewResultDto | null>(null);
   const t = (key: string, fallback: string) => translate(language, key, fallback);
+  const handleQueueSelect = useCallback((id: string, checked: boolean) => {
+    setSelectedIds((current) => {
+      if (checked) return current.includes(id) ? current : [...current, id];
+      return current.filter((value) => value !== id);
+    });
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -194,7 +221,9 @@ function MainWindow() {
     }).catch(() => undefined);
     void api
       .subscribeQueue((message: QueueStreamMessage) => {
-        if (message.type === "snapshot") setSnapshot(message.data);
+        if (message.type === "snapshot" || message.type === "progressBatch") {
+          setSnapshot((current) => queueStreamReducer(current, message));
+        }
       })
       .then((value) => {
         if (disposed) {
@@ -458,7 +487,7 @@ function MainWindow() {
           </div>
           <p className="queue-progress">Queue: {metrics.queuePercent.toFixed(1)}% ({metrics.completedItems}/{metrics.totalItems}) · ETA: {formatDuration(metrics.etaSec)}</p>
           <progress max="100" value={metrics.queuePercent} />
-          <QueueTable items={snapshot.state.items} selected={selectedIds} onSelect={(id, checked) => setSelectedIds((current) => checked ? [...current, id] : current.filter((value) => value !== id))} t={t} />
+          <QueueTable items={snapshot.state.items} selected={selectedIds} onSelect={handleQueueSelect} t={t} />
           <div className="inline-actions"><button disabled={selectedRetryIds.length === 0} onClick={() => api.queueRetry(selectedRetryIds).catch((error) => setMessage(errorText(error)))}>{t("gui.button.retry", "Retry selected")}</button><button disabled={selectedRows.length === 0} onClick={() => api.removeQueue(selectedRows.map((item) => item.itemId)).catch((error) => setMessage(errorText(error)))}>{t("gui.button.remove", "Remove")}</button><button disabled={metrics.totalItems === 0} onClick={() => api.clearCompleted().catch((error) => setMessage(errorText(error)))}>{t("gui.button.clear_completed", "Clear completed")}</button></div>
         </section>
       </main>
@@ -563,7 +592,11 @@ const QueueRow = React.memo(function QueueRow({
       <td>{item.status === "queued" ? "-" : `${item.progress.percent.toFixed(1)}%`}</td>
     </tr>
   );
-});
+}, (previous, next) => (
+  previous.item === next.item
+  && previous.checked === next.checked
+  && previous.onSelect === next.onSelect
+));
 
 function QueueTable({
   items,
@@ -649,7 +682,12 @@ function QueuePanel({ snapshot, t }: { snapshot: QueueSnapshotDto; t: (key: stri
   const retryIds = snapshot.state.items
     .filter((item) => selected.includes(item.itemId) && (item.status === "failed" || item.status === "cancelled"))
     .map((item) => item.itemId);
-  const updateSelection = (id: string, checked: boolean) => setSelected((current) => checked ? [...current, id] : current.filter((value) => value !== id));
+  const updateSelection = useCallback((id: string, checked: boolean) => {
+    setSelected((current) => {
+      if (checked) return current.includes(id) ? current : [...current, id];
+      return current.filter((value) => value !== id);
+    });
+  }, []);
   async function run(action: () => Promise<unknown>) {
     try {
       await action();
@@ -682,6 +720,15 @@ function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) 
   const [events, setEvents] = useState<ActivityEventDto[]>([]);
   const [filter, setFilter] = useState("all");
   const [message, setMessage] = useState("");
+  const pendingEvents = useRef<ActivityEventDto[]>([]);
+  const flushTimer = useRef<number | undefined>(undefined);
+  const flushPendingEvents = useCallback(() => {
+    flushTimer.current = undefined;
+    if (pendingEvents.current.length === 0) return;
+    const pending = pendingEvents.current;
+    pendingEvents.current = [];
+    setEvents((current) => [...current, ...pending].slice(-ACTIVITY_UI_LIMIT));
+  }, []);
   useEffect(() => {
     let disposed = false;
     let handle: SubscriptionHandle | undefined;
@@ -693,8 +740,16 @@ function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) 
     void api
       .subscribeActivity((message) => {
         if (message.type === "activity") {
-          setEvents((current) => [...current, message.data].slice(-ACTIVITY_UI_LIMIT));
+          pendingEvents.current.push(message.data);
+          if (flushTimer.current === undefined) {
+            flushTimer.current = window.setTimeout(flushPendingEvents, 100);
+          }
         } else if (message.type === "activityReset") {
+          pendingEvents.current = [];
+          if (flushTimer.current !== undefined) {
+            window.clearTimeout(flushTimer.current);
+            flushTimer.current = undefined;
+          }
           setEvents(message.data.events.slice(-ACTIVITY_UI_LIMIT));
         }
       })
@@ -708,9 +763,12 @@ function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) 
       .catch(() => undefined);
     return () => {
       disposed = true;
+      if (flushTimer.current !== undefined) window.clearTimeout(flushTimer.current);
+      flushTimer.current = undefined;
+      pendingEvents.current = [];
       void handle?.unsubscribe();
     };
-  }, []);
+  }, [flushPendingEvents]);
   const visible = useMemo(
     () => (filter === "all" ? events : events.filter((event) => event.category === filter)).slice(-ACTIVITY_UI_LIMIT),
     [events, filter],
@@ -718,6 +776,11 @@ function ActivityPanel({ t }: { t: (key: string, fallback: string) => string }) 
   async function clear() {
     try {
       await api.activityClear();
+      pendingEvents.current = [];
+      if (flushTimer.current !== undefined) {
+        window.clearTimeout(flushTimer.current);
+        flushTimer.current = undefined;
+      }
       setEvents([]);
     } catch (error) {
       setMessage(errorText(error));

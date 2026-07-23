@@ -229,6 +229,15 @@ pub struct QueueSnapshotDto {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
+pub struct QueueProgressDeltaDto {
+    #[serde(rename = "itemId")]
+    pub item_id: String,
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    pub progress: QueueProgressDto,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct ActivityEventDto {
     #[ts(type = "number")]
     pub sequence: u64,
@@ -242,6 +251,7 @@ pub struct ActivityEventDto {
 #[allow(clippy::large_enum_variant)]
 pub enum QueueStreamMessage {
     Snapshot(QueueSnapshotDto),
+    ProgressBatch { updates: Vec<QueueProgressDeltaDto>, metrics: QueueMetricsDto },
     Activity(ActivityEventDto),
     ActivityReset { events: Vec<ActivityEventDto> },
 }

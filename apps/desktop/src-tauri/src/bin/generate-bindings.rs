@@ -25,6 +25,7 @@ fn generated_text() -> String {
         contracts::QueueMetricsDto::decl(),
         contracts::QueueStateDto::decl(),
         contracts::QueueSnapshotDto::decl(),
+        contracts::QueueProgressDeltaDto::decl(),
         contracts::ActivityEventDto::decl(),
         contracts::QueueStreamMessage::decl(),
         contracts::PreviewOptionsDto::decl(),
